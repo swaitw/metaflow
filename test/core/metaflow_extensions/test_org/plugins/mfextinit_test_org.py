@@ -1,9 +1,9 @@
-from .flow_options import FlowDecoratorWithOptions
+STEP_DECORATORS_DESC = [
+    ("test_step_decorator", ".test_step_decorator.TestStepDecorator"),
+]
 
-FLOW_DECORATORS = [FlowDecoratorWithOptions]
+FLOW_DECORATORS_DESC = [
+    ("test_flow_decorator", ".flow_options.FlowDecoratorWithOptions"),
+]
 
-from .test_step_decorator import TestStepDecorator
-
-STEP_DECORATORS = [TestStepDecorator]
-
-__mf_promote_submodules__ = ["nondecoplugin"]
+__mf_promote_submodules__ = ["nondecoplugin", "frameworks"]

@@ -1,9 +1,9 @@
-import os
 import json
+import os
 import random
 import string
 import zlib
-from itertools import dropwhile, islice
+from itertools import dropwhile
 
 from metaflow.util import to_bytes
 
@@ -38,7 +38,11 @@ def _load_config(path):
 
 
 def _path(token_prefix):
-    home = os.environ.get("METAFLOW_HOME", "~/.metaflowconfig")
+    # TODO make this a MF config variable
+    if os.environ.get("METAFLOW_TOKEN_HOME"):
+        home = os.environ.get("METAFLOW_TOKEN_HOME")
+    else:
+        home = os.environ.get("METAFLOW_HOME", "~/.metaflowconfig")
     return os.path.expanduser("%s/%s" % (home, token_prefix))
 
 

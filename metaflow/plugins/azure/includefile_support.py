@@ -8,6 +8,8 @@ from metaflow.exception import MetaflowException, MetaflowInternalError
 
 
 class Azure(object):
+    TYPE = "azure"
+
     @classmethod
     def get_root_from_config(cls, echo, create_on_absent=True):
         from metaflow.metaflow_config import DATATOOLS_AZUREROOT
@@ -29,9 +31,9 @@ class Azure(object):
         # we parse out the container name only, and use that to root our storage implementation
         container_name, _ = parse_azure_full_path(key)
         # Import DATASTORES dynamically... otherwise, circular import
-        from metaflow.datastore import DATASTORES
+        from metaflow.plugins import DATASTORES
 
-        storage_impl = DATASTORES["azure"]
+        storage_impl = [d for d in DATASTORES if d.TYPE == "azure"][0]
         return storage_impl(container_name)
 
     def __enter__(self):

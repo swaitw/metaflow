@@ -1,15 +1,19 @@
-from metaflow.datastore import DATASTORES, FlowDataStore
-from metaflow.metaflow_config import DATASTORE_CARD_SUFFIX
+from typing import Optional, Union, TYPE_CHECKING
+from metaflow.datastore import FlowDataStore
+from metaflow.metaflow_config import CARD_SUFFIX
 from .card_resolver import resolve_paths_from_task, resumed_info
-from .card_datastore import CardDatastore
+from .card_datastore import CardDatastore, CardNameSuffix
 from .exception import (
     UnresolvableDatastoreException,
-    IncorrectArguementException,
+    IncorrectArgumentException,
     IncorrectPathspecException,
 )
 import os
 import tempfile
 import uuid
+
+if TYPE_CHECKING:
+    import metaflow
 
 _TYPE = type
 _ID_FUNC = id
@@ -43,6 +47,7 @@ class Card:
         self._created_on = created_on
         self._card_ds = card_ds
         self._card_id = id
+        self._data_path = None
 
         # public attributes
         self.hash = hash
@@ -53,7 +58,18 @@ class Card:
         # Tempfile to open stuff in browser
         self._temp_file = None
 
-    def get(self):
+    def get_data(self) -> Optional[dict]:
+        # currently an internal method to retrieve a card's data.
+        if self._data_path is None:
+            data_paths = self._card_ds.extract_data_paths(
+                card_type=self.type, card_hash=self.hash, card_id=self._card_id
+            )
+            if len(data_paths) == 0:
+                return None
+            self._data_path = data_paths[0]
+        return self._card_ds.get_card_data(self._data_path)
+
+    def get(self) -> str:
         """
         Retrieves the HTML contents of the card from the
         Metaflow datastore.
@@ -69,24 +85,34 @@ class Card:
         return self._html
 
     @property
-    def path(self):
+    def path(self) -> str:
         """
         The path of the card in the datastore which uniquely
         identifies the card.
+
+        Returns
+        -------
+        str
+            Path to the card
         """
         return self._path
 
     @property
-    def id(self):
+    def id(self) -> Optional[str]:
         """
         The ID of the card, if specified with `@card(id=ID)`.
+
+        Returns
+        -------
+        Optional[str]
+            ID of the card
         """
         return self._card_id
 
     def __str__(self):
         return "<Card at '%s'>" % self._path
 
-    def view(self):
+    def view(self) -> None:
         """
         Opens the card in a local web browser.
 
@@ -129,7 +155,7 @@ class CardContainer:
     ```
     cards = get_cards(MyTask)
 
-    # retrive by index
+    # retrieve by index
     first_card = cards[0]
 
     # check length
@@ -141,12 +167,12 @@ class CardContainer:
     ```
     """
 
-    def __init__(self, card_paths, card_ds, from_resumed=False, origin_pathspec=None):
+    def __init__(self, card_paths, card_ds, origin_pathspec=None):
         self._card_paths = card_paths
         self._card_ds = card_ds
         self._current = 0
         self._high = len(card_paths)
-        self.from_resumed = from_resumed
+        self.from_resumed = origin_pathspec is not None
         self.origin_pathspec = origin_pathspec
 
     def __len__(self):
@@ -163,7 +189,7 @@ class CardContainer:
         if index >= self._high:
             raise IndexError
         path = self._card_paths[index]
-        card_info = self._card_ds.card_info_from_path(path)
+        card_info = self._card_ds.info_from_path(path, suffix=CardNameSuffix.CARD)
         # todo : find card creation date and put it in client.
         return Card(
             self._card_ds,
@@ -195,27 +221,32 @@ class CardContainer:
         return "\n".join(main_html)
 
 
-def get_cards(task, id=None, type=None, follow_resumed=True):
+def get_cards(
+    task: Union[str, "metaflow.Task"],
+    id: Optional[str] = None,
+    type: Optional[str] = None,
+    follow_resumed: bool = True,
+) -> CardContainer:
     """
     Get cards related to a `Task`.
 
-    Note that `get_cards` resolves the cards contained by the task but it doesn't actually
+    Note that `get_cards` resolves the cards contained by the task, but it doesn't actually
     retrieve them from the datastore. Actual card contents are retrieved lazily either when
     the card is rendered in a notebook to when you call `Card.get`. This means that
     `get_cards` is a fast call even when individual cards contain a lot of data.
 
     Parameters
     ----------
-    task : str or `Task`
+    task : Union[str, `Task`]
         A `Task` object or pathspec `{flow_name}/{run_id}/{step_name}/{task_id}` that
         uniquely identifies a task.
-    id : str (optional)
+    id : str, optional, default None
         The ID of card to retrieve if multiple cards are present.
-    type : str (optional)
+    type : str, optional, default None
         The type of card to retrieve if multiple cards are present.
-    follow_resumed : bool (optional)
+    follow_resumed : bool, default True
         If the task has been resumed, then setting this flag will resolve the card for
-        the origin task. Defaults to True.
+        the origin task.
 
     Returns
     -------
@@ -231,13 +262,14 @@ def get_cards(task, id=None, type=None, follow_resumed=True):
         if len(task_str.split("/")) != 4:
             # Exception that pathspec is not of correct form
             raise IncorrectPathspecException(task_str)
-        # set namepsace as None so that we don't face namespace mismatch error.
+        # set namespace as None so that we don't face namespace mismatch error.
         namespace(None)
         task = Task(task_str)
     elif not isinstance(task, Task):
-        # Exception that the task argument should of form `Task` or `str`
-        raise IncorrectArguementException(_TYPE(task))
+        # Exception that the task argument should be of form `Task` or `str`
+        raise IncorrectArgumentException(_TYPE(task))
 
+    origin_taskpathspec = None
     if follow_resumed:
         origin_taskpathspec = resumed_info(task)
         if origin_taskpathspec:
@@ -249,7 +281,6 @@ def get_cards(task, id=None, type=None, follow_resumed=True):
     return CardContainer(
         card_paths,
         card_ds,
-        from_resumed=origin_taskpathspec is not None,
         origin_pathspec=origin_taskpathspec,
     )
 
@@ -259,7 +290,7 @@ def _get_flow_datastore(task):
     # Resolve datastore type
     ds_type = None
     # We need to set the correct datastore root here so that
-    # we can ensure the the card client picks up the correct path to the cards
+    # we can ensure that the card client picks up the correct path to the cards
 
     meta_dict = task.metadata_dict
     ds_type = meta_dict.get("ds-type", None)
@@ -269,11 +300,14 @@ def _get_flow_datastore(task):
 
     ds_root = meta_dict.get("ds-root", None)
     if ds_root:
-        ds_root = os.path.join(ds_root, DATASTORE_CARD_SUFFIX)
+        ds_root = os.path.join(ds_root, CARD_SUFFIX)
     else:
         ds_root = CardDatastore.get_storage_root(ds_type)
 
-    storage_impl = DATASTORES[ds_type]
+    # Delay load to prevent circular dep
+    from metaflow.plugins import DATASTORES
+
+    storage_impl = [d for d in DATASTORES if d.TYPE == ds_type][0]
     return FlowDataStore(
         flow_name=flow_name,
         environment=None,  # TODO: Add environment here

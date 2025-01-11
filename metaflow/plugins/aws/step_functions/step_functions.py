@@ -1,31 +1,29 @@
-import os
-from collections import defaultdict
-import sys
 import hashlib
 import json
-import time
-import string
+import os
 import random
-import uuid
+import string
+import sys
+from collections import defaultdict
 
-from metaflow.exception import MetaflowException, MetaflowInternalError
-from metaflow.plugins import ResourcesDecorator, BatchDecorator, RetryDecorator
-from metaflow.parameters import deploy_time_eval
+from metaflow import R
 from metaflow.decorators import flow_decorators
-from metaflow.util import compress_list, dict_to_cli_options, to_pascalcase
+from metaflow.exception import MetaflowException
 from metaflow.metaflow_config import (
-    SFN_IAM_ROLE,
     EVENTS_SFN_ACCESS_IAM_ROLE,
+    S3_ENDPOINT_URL,
     SFN_DYNAMO_DB_TABLE,
     SFN_EXECUTION_LOG_GROUP_ARN,
-    S3_ENDPOINT_URL,
+    SFN_IAM_ROLE,
+    SFN_S3_DISTRIBUTED_MAP_OUTPUT_PATH,
 )
-from metaflow import R
+from metaflow.parameters import deploy_time_eval
+from metaflow.user_configs.config_options import ConfigInput
+from metaflow.util import dict_to_cli_options, to_pascalcase
 
-from .step_functions_client import StepFunctionsClient
-from .event_bridge_client import EventBridgeClient
 from ..batch.batch import Batch
-from ..aws_utils import compute_resource_attributes
+from .event_bridge_client import EventBridgeClient
+from .step_functions_client import StepFunctionsClient
 
 
 class StepFunctionsException(MetaflowException):
@@ -56,6 +54,7 @@ class StepFunctions(object):
         max_workers=None,
         workflow_timeout=None,
         is_project=False,
+        use_distributed_map=False,
     ):
         self.name = name
         self.graph = graph
@@ -73,6 +72,10 @@ class StepFunctions(object):
         self.username = username
         self.max_workers = max_workers
         self.workflow_timeout = workflow_timeout
+        self.config_parameters = self._process_config_parameters()
+
+        # https://aws.amazon.com/blogs/aws/step-functions-distributed-map-a-serverless-solution-for-large-scale-parallel-data-processing/
+        self.use_distributed_map = use_distributed_map
 
         self._client = StepFunctionsClient()
         self._workflow = self._compile()
@@ -85,7 +88,7 @@ class StepFunctions(object):
     def trigger_explanation(self):
         if self._cron:
             # Sometime in the future, we should vendor (or write) a utility
-            # that can translate cron specifications into a human readable
+            # that can translate cron specifications into a human-readable
             # format and push to the user for a better UX, someday.
             return (
                 "This workflow triggers automatically "
@@ -157,6 +160,27 @@ class StepFunctions(object):
             raise StepFunctionsSchedulingException(repr(e))
 
     @classmethod
+    def delete(cls, name):
+        # Always attempt to delete the event bridge rule.
+        schedule_deleted = EventBridgeClient(name).delete()
+
+        sfn_deleted = StepFunctionsClient().delete(name)
+
+        if sfn_deleted is None:
+            raise StepFunctionsException(
+                "The workflow *%s* doesn't exist on AWS Step Functions." % name
+            )
+
+        return schedule_deleted, sfn_deleted
+
+    @classmethod
+    def terminate(cls, flow_name, name):
+        client = StepFunctionsClient()
+        execution_arn, _, _, _ = cls.get_execution(flow_name, name)
+        response = client.terminate_execution(execution_arn)
+        return response
+
+    @classmethod
     def trigger(cls, name, parameters):
         try:
             state_machine = StepFunctionsClient().get(name)
@@ -171,8 +195,8 @@ class StepFunctions(object):
         # Dump parameters into `Parameters` input field.
         input = json.dumps({"Parameters": json.dumps(parameters)})
         # AWS Step Functions limits input to be 32KiB, but AWS Batch
-        # has it's own limitation of 30KiB for job specification length.
-        # Reserving 10KiB for rest of the job sprecification leaves 20KiB
+        # has its own limitation of 30KiB for job specification length.
+        # Reserving 10KiB for rest of the job specification leaves 20KiB
         # for us, which should be enough for most use cases for now.
         if len(input) > 20480:
             raise StepFunctionsException(
@@ -212,7 +236,7 @@ class StepFunctions(object):
                 return parameters.get("metaflow.owner"), parameters.get(
                     "metaflow.production_token"
                 )
-            except KeyError as e:
+            except KeyError:
                 raise StepFunctionsException(
                     "An existing non-metaflow "
                     "workflow with the same name as "
@@ -224,7 +248,58 @@ class StepFunctions(object):
                 )
         return None
 
+    @classmethod
+    def get_execution(cls, state_machine_name, name):
+        client = StepFunctionsClient()
+        try:
+            state_machine = client.get(state_machine_name)
+        except Exception as e:
+            raise StepFunctionsException(repr(e))
+        if state_machine is None:
+            raise StepFunctionsException(
+                "The state machine *%s* doesn't exist on AWS Step Functions."
+                % state_machine_name
+            )
+        try:
+            state_machine_arn = state_machine.get("stateMachineArn")
+            environment_vars = (
+                json.loads(state_machine.get("definition"))
+                .get("States")
+                .get("start")
+                .get("Parameters")
+                .get("ContainerOverrides")
+                .get("Environment")
+            )
+            parameters = {
+                item.get("Name"): item.get("Value") for item in environment_vars
+            }
+            executions = client.list_executions(state_machine_arn, states=["RUNNING"])
+            for execution in executions:
+                if execution.get("name") == name:
+                    try:
+                        return (
+                            execution.get("executionArn"),
+                            parameters.get("METAFLOW_OWNER"),
+                            parameters.get("METAFLOW_PRODUCTION_TOKEN"),
+                            parameters.get("SFN_STATE_MACHINE"),
+                        )
+                    except KeyError:
+                        raise StepFunctionsException(
+                            "A non-metaflow workflow *%s* already exists in AWS Step Functions."
+                            % name
+                        )
+            return None
+        except Exception as e:
+            raise StepFunctionsException(repr(e))
+
     def _compile(self):
+        if self.flow._flow_decorators.get("trigger") or self.flow._flow_decorators.get(
+            "trigger_on_finish"
+        ):
+            raise StepFunctionsException(
+                "Deploying flows with @trigger or @trigger_on_finish decorator(s) "
+                "to AWS Step Functions is not supported currently."
+            )
 
         # Visit every node of the flow and recursively build the state machine.
         def _visit(node, workflow, exit_node=None):
@@ -297,17 +372,80 @@ class StepFunctions(object):
                     .parameter("SplitParentTaskId.$", "$.JobId")
                     .parameter("Parameters.$", "$.Parameters")
                     .parameter("Index.$", "$$.Map.Item.Value")
-                    .next(node.matching_join)
+                    .next(
+                        "%s_*GetManifest" % iterator_name
+                        if self.use_distributed_map
+                        else node.matching_join
+                    )
                     .iterator(
                         _visit(
                             self.graph[node.out_funcs[0]],
-                            Workflow(node.out_funcs[0]).start_at(node.out_funcs[0]),
+                            Workflow(node.out_funcs[0])
+                            .start_at(node.out_funcs[0])
+                            .mode(
+                                "DISTRIBUTED" if self.use_distributed_map else "INLINE"
+                            ),
                             node.matching_join,
                         )
                     )
                     .max_concurrency(self.max_workers)
-                    .output_path("$.[0]")
+                    # AWS Step Functions has a short coming for DistributedMap at the
+                    # moment that does not allow us to subset the output of for-each
+                    # to just a single element. We have to rely on a rather terrible
+                    # hack and resort to using ResultWriter to write the state to
+                    # Amazon S3 and process it in another task. But, well what can we
+                    # do...
+                    .result_writer(
+                        *(
+                            (
+                                (
+                                    SFN_S3_DISTRIBUTED_MAP_OUTPUT_PATH[len("s3://") :]
+                                    if SFN_S3_DISTRIBUTED_MAP_OUTPUT_PATH.startswith(
+                                        "s3://"
+                                    )
+                                    else SFN_S3_DISTRIBUTED_MAP_OUTPUT_PATH
+                                ).split("/", 1)
+                                + [""]
+                            )[:2]
+                            if self.use_distributed_map
+                            else (None, None)
+                        )
+                    )
+                    .output_path("$" if self.use_distributed_map else "$.[0]")
                 )
+                if self.use_distributed_map:
+                    workflow.add_state(
+                        State("%s_*GetManifest" % iterator_name)
+                        .resource("arn:aws:states:::aws-sdk:s3:getObject")
+                        .parameter("Bucket.$", "$.ResultWriterDetails.Bucket")
+                        .parameter("Key.$", "$.ResultWriterDetails.Key")
+                        .next("%s_*Map" % iterator_name)
+                        .result_selector("Body.$", "States.StringToJson($.Body)")
+                    )
+                    workflow.add_state(
+                        Map("%s_*Map" % iterator_name)
+                        .iterator(
+                            Workflow("%s_*PassWorkflow" % iterator_name)
+                            .mode("DISTRIBUTED")
+                            .start_at("%s_*Pass" % iterator_name)
+                            .add_state(
+                                Pass("%s_*Pass" % iterator_name)
+                                .end()
+                                .parameter("Output.$", "States.StringToJson($.Output)")
+                                .output_path("$.Output")
+                            )
+                        )
+                        .next(node.matching_join)
+                        .max_concurrency(1000)
+                        .item_reader(
+                            JSONItemReader()
+                            .resource("arn:aws:states:::s3:getObject")
+                            .parameter("Bucket.$", "$.Body.DestinationBucket")
+                            .parameter("Key.$", "$.Body.ResultFiles.SUCCEEDED[0].Key")
+                        )
+                        .output_path("$.[0]")
+                    )
+
                 # Continue the traversal from the matching_join.
                 _visit(self.graph[node.matching_join], workflow, exit_node)
             # We shouldn't ideally ever get here.
@@ -327,6 +465,11 @@ class StepFunctions(object):
     def _cron(self):
         schedule = self.flow._flow_decorators.get("schedule")
         if schedule:
+            schedule = schedule[0]
+            if schedule.timezone is not None:
+                raise StepFunctionsException(
+                    "Step Functions does not support scheduling with a timezone."
+                )
             return schedule.schedule
         return None
 
@@ -344,6 +487,10 @@ class StepFunctions(object):
                     "case-insensitive." % param.name
                 )
             seen.add(norm)
+            # NOTE: We skip config parameters as these do not have dynamic values,
+            # and need to be treated differently.
+            if param.IS_CONFIG_PARAMETER:
+                continue
 
             is_required = param.kwargs.get("required", False)
             # Throw an exception if a schedule is set for a flow with required
@@ -360,6 +507,27 @@ class StepFunctions(object):
             parameters.append(dict(name=param.name, value=value))
         return parameters
 
+    def _process_config_parameters(self):
+        parameters = []
+        seen = set()
+        for var, param in self.flow._get_parameters():
+            if not param.IS_CONFIG_PARAMETER:
+                continue
+            # Throw an exception if the parameter is specified twice.
+            norm = param.name.lower()
+            if norm in seen:
+                raise MetaflowException(
+                    "Parameter *%s* is specified twice. "
+                    "Note that parameter names are "
+                    "case-insensitive." % param.name
+                )
+            seen.add(norm)
+
+            parameters.append(
+                dict(name=param.name, kv_name=ConfigInput.make_key_name(param.name))
+            )
+        return parameters
+
     def _batch(self, node):
         attrs = {
             # metaflow.user is only used for setting the AWS Job Name.
@@ -371,7 +539,6 @@ class StepFunctions(object):
             "metaflow.owner": self.username,
             "metaflow.flow_name": self.flow.name,
             "metaflow.step_name": node.name,
-            "metaflow.run_id.$": "$$.Execution.Name",
             # Unfortunately we can't set the task id here since AWS Step
             # Functions lacks any notion of run-scoped task identifiers. We
             # instead co-opt the AWS Batch job id as the task id. This also
@@ -383,6 +550,10 @@ class StepFunctions(object):
             # `$$.State.RetryCount` resolves to an int dynamically and
             # AWS Batch job specification only accepts strings. We handle
             # retries/catch within AWS Batch to get around this limitation.
+            # And, we also cannot set the run id here since the run id maps to
+            # the execution name of the AWS Step Functions State Machine, which
+            # is different when executing inside a distributed map. We set it once
+            # in the start step and move it along to be consumed by all the children.
             "metaflow.version": self.environment.get_environment_info()[
                 "metaflow_version"
             ],
@@ -412,13 +583,19 @@ class StepFunctions(object):
         env_deco = [deco for deco in node.decorators if deco.name == "environment"]
         env = {}
         if env_deco:
-            env = env_deco[0].attributes["vars"]
+            env = env_deco[0].attributes["vars"].copy()
 
         # add METAFLOW_S3_ENDPOINT_URL
         if S3_ENDPOINT_URL is not None:
             env["METAFLOW_S3_ENDPOINT_URL"] = S3_ENDPOINT_URL
 
         if node.name == "start":
+            # metaflow.run_id maps to AWS Step Functions State Machine Execution in all
+            # cases except for when within a for-each construct that relies on
+            # Distributed Map. To work around this issue, we pass the run id from the
+            # start step to all subsequent tasks.
+            attrs["metaflow.run_id.$"] = "$$.Execution.Name"
+
             # Initialize parameters for the flow in the `start` step.
             parameters = self._process_parameters()
             if parameters:
@@ -464,7 +641,7 @@ class StepFunctions(object):
                     "${METAFLOW_PARENT_TASK_IDS}" % node.in_funcs[0]
                 )
                 # Unfortunately, AWS Batch only allows strings as value types
-                # in it's specification and we don't have any way to concatenate
+                # in its specification, and we don't have any way to concatenate
                 # the task ids array from the parent steps within AWS Step
                 # Functions and pass it down to AWS Batch. We instead have to
                 # rely on publishing the state to DynamoDb and fetching it back
@@ -477,6 +654,8 @@ class StepFunctions(object):
                 env["METAFLOW_SPLIT_PARENT_TASK_ID"] = (
                     "$.Parameters.split_parent_task_id_%s" % node.split_parents[-1]
                 )
+                # Inherit the run id from the parent and pass it along to children.
+                attrs["metaflow.run_id.$"] = "$.Parameters.['metaflow.run_id']"
             else:
                 # Set appropriate environment variables for runtime replacement.
                 if len(node.in_funcs) == 1:
@@ -485,6 +664,8 @@ class StepFunctions(object):
                         % node.in_funcs[0]
                     )
                     env["METAFLOW_PARENT_TASK_ID"] = "$.JobId"
+                    # Inherit the run id from the parent and pass it along to children.
+                    attrs["metaflow.run_id.$"] = "$.Parameters.['metaflow.run_id']"
                 else:
                     # Generate the input paths in a quasi-compressed format.
                     # See util.decompress_list for why this is written the way
@@ -494,6 +675,8 @@ class StepFunctions(object):
                         "${METAFLOW_PARENT_%s_TASK_ID}" % (idx, idx)
                         for idx, _ in enumerate(node.in_funcs)
                     )
+                    # Inherit the run id from the parent and pass it along to children.
+                    attrs["metaflow.run_id.$"] = "$.[0].Parameters.['metaflow.run_id']"
                     for idx, _ in enumerate(node.in_funcs):
                         env["METAFLOW_PARENT_%s_TASK_ID" % idx] = "$.[%s].JobId" % idx
                         env["METAFLOW_PARENT_%s_STEP" % idx] = (
@@ -508,9 +691,9 @@ class StepFunctions(object):
                 # input to those descendent tasks. We set and propagate the
                 # task ids pointing to split_parents through every state.
                 if any(self.graph[n].type == "foreach" for n in node.in_funcs):
-                    attrs[
-                        "split_parent_task_id_%s.$" % node.split_parents[-1]
-                    ] = "$.SplitParentTaskId"
+                    attrs["split_parent_task_id_%s.$" % node.split_parents[-1]] = (
+                        "$.SplitParentTaskId"
+                    )
                     for parent in node.split_parents[:-1]:
                         if self.graph[parent].type == "foreach":
                             attrs["split_parent_task_id_%s.$" % parent] = (
@@ -522,7 +705,7 @@ class StepFunctions(object):
                         # parent tasks. We filter the Map state to only output
                         # `$.[0]`, since we don't need any of the other outputs,
                         # that information is available to us from AWS DynamoDB.
-                        # This has a nice side-effect of making our foreach
+                        # This has a nice side effect of making our foreach
                         # splits infinitely scalable because otherwise we would
                         # be bounded by the 32K state limit for the outputs. So,
                         # instead of referencing `Parameters` fields by index
@@ -591,10 +774,15 @@ class StepFunctions(object):
         metaflow_version["production_token"] = self.production_token
         env["METAFLOW_VERSION"] = json.dumps(metaflow_version)
 
+        # map config values
+        cfg_env = {param["name"]: param["kv_name"] for param in self.config_parameters}
+        if cfg_env:
+            env["METAFLOW_FLOW_CONFIG_VALUE"] = json.dumps(cfg_env)
+
         # Set AWS DynamoDb Table Name for state tracking for for-eaches.
         # There are three instances when metaflow runtime directly interacts
         # with AWS DynamoDB.
-        #   1. To set the cardinality of foreaches (which are subsequently)
+        #   1. To set the cardinality of `foreach`s (which are subsequently)
         #      read prior to the instantiation of the Map state by AWS Step
         #      Functions.
         #   2. To set the input paths from the parent steps of a foreach join.
@@ -630,18 +818,12 @@ class StepFunctions(object):
             env["METAFLOW_SFN_DYNAMO_DB_TABLE"] = SFN_DYNAMO_DB_TABLE
 
         # It makes no sense to set env vars to None (shows up as "None" string)
-        env_without_none_values = {k: v for k, v in env.items() if v is not None}
-        del env
+        env = {k: v for k, v in env.items() if v is not None}
 
         # Resolve AWS Batch resource requirements.
         batch_deco = [deco for deco in node.decorators if deco.name == "batch"][0]
         resources = {}
         resources.update(batch_deco.attributes)
-        resources.update(
-            compute_resource_attributes(
-                node.decorators, batch_deco, batch_deco.resource_defaults
-            )
-        )
         # Resolve retry strategy.
         user_code_retries, total_retries = self._get_retries(node)
 
@@ -679,9 +861,19 @@ class StepFunctions(object):
                 shared_memory=resources["shared_memory"],
                 max_swap=resources["max_swap"],
                 swappiness=resources["swappiness"],
-                env=env_without_none_values,
+                efa=resources["efa"],
+                use_tmpfs=resources["use_tmpfs"],
+                tmpfs_tempdir=resources["tmpfs_tempdir"],
+                tmpfs_size=resources["tmpfs_size"],
+                tmpfs_path=resources["tmpfs_path"],
+                inferentia=resources["inferentia"],
+                env=env,
                 attrs=attrs,
                 host_volumes=resources["host_volumes"],
+                efs_volumes=resources["efs_volumes"],
+                ephemeral_storage=resources["ephemeral_storage"],
+                log_driver=resources["log_driver"],
+                log_options=resources["log_options"],
             )
             .attempts(total_retries + 1)
         )
@@ -721,7 +913,7 @@ class StepFunctions(object):
         # FlowDecorators can define their own top-level options. They are
         # responsible for adding their own top-level options and values through
         # the get_top_level_options() hook. See similar logic in runtime.py.
-        for deco in flow_decorators():
+        for deco in flow_decorators(self.flow):
             top_opts_dict.update(deco.get_top_level_options())
 
         top_opts = list(dict_to_cli_options(top_opts_dict))
@@ -764,7 +956,7 @@ class StepFunctions(object):
                 params.extend("--tag %s" % tag for tag in self.tags)
 
             # If the start step gets retried, we must be careful not to
-            # regenerate multiple parameters tasks. Hence we check first if
+            # regenerate multiple parameters tasks. Hence, we check first if
             # _parameters exists already.
             exists = entrypoint + [
                 "dump",
@@ -819,6 +1011,12 @@ class Workflow(object):
         tree = lambda: defaultdict(tree)
         self.payload = tree()
 
+    def mode(self, mode):
+        self.payload["ProcessorConfig"] = {"Mode": mode}
+        if mode == "DISTRIBUTED":
+            self.payload["ProcessorConfig"]["ExecutionType"] = "STANDARD"
+        return self
+
     def start_at(self, start_at):
         self.payload["StartAt"] = start_at
         return self
@@ -866,9 +1064,17 @@ class State(object):
         self.payload["ResultPath"] = result_path
         return self
 
+    def result_selector(self, name, value):
+        self.payload["ResultSelector"][name] = value
+        return self
+
     def _partition(self):
         # This is needed to support AWS Gov Cloud and AWS CN regions
         return SFN_IAM_ROLE.split(":")[1]
+
+    def retry_strategy(self, retry_strategy):
+        self.payload["Retry"] = [retry_strategy]
+        return self
 
     def batch(self, job):
         self.resource(
@@ -889,6 +1095,19 @@ class State(object):
         # tags may not be present in all scenarios
         if "tags" in job.payload:
             self.parameter("Tags", job.payload["tags"])
+        # set retry strategy for AWS Batch job submission to account for the
+        # measily 50 jobs / second queue admission limit which people can
+        # run into very quickly.
+        self.retry_strategy(
+            {
+                "ErrorEquals": ["Batch.AWSBatchException"],
+                "BackoffRate": 2,
+                "IntervalSeconds": 2,
+                "MaxDelaySeconds": 60,
+                "MaxAttempts": 10,
+                "JitterStrategy": "FULL",
+            }
+        )
         return self
 
     def dynamo_db(self, table_name, primary_key, values):
@@ -899,6 +1118,26 @@ class State(object):
         ).parameter(
             "ProjectionExpression", values
         )
+        return self
+
+
+class Pass(object):
+    def __init__(self, name):
+        self.name = name
+        tree = lambda: defaultdict(tree)
+        self.payload = tree()
+        self.payload["Type"] = "Pass"
+
+    def end(self):
+        self.payload["End"] = True
+        return self
+
+    def parameter(self, name, value):
+        self.payload["Parameters"][name] = value
+        return self
+
+    def output_path(self, output_path):
+        self.payload["OutputPath"] = output_path
         return self
 
 
@@ -962,4 +1201,38 @@ class Map(object):
 
     def result_path(self, result_path):
         self.payload["ResultPath"] = result_path
+        return self
+
+    def item_reader(self, item_reader):
+        self.payload["ItemReader"] = item_reader.payload
+        return self
+
+    def result_writer(self, bucket, prefix):
+        if bucket is not None and prefix is not None:
+            self.payload["ResultWriter"] = {
+                "Resource": "arn:aws:states:::s3:putObject",
+                "Parameters": {
+                    "Bucket": bucket,
+                    "Prefix": prefix,
+                },
+            }
+        return self
+
+
+class JSONItemReader(object):
+    def __init__(self):
+        tree = lambda: defaultdict(tree)
+        self.payload = tree()
+        self.payload["ReaderConfig"] = {"InputType": "JSON", "MaxItems": 1}
+
+    def resource(self, resource):
+        self.payload["Resource"] = resource
+        return self
+
+    def parameter(self, name, value):
+        self.payload["Parameters"][name] = value
+        return self
+
+    def output_path(self, output_path):
+        self.payload["OutputPath"] = output_path
         return self

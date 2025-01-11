@@ -9,7 +9,7 @@ from metaflow.util import to_bytes, to_fileobj, to_unicode
 
 VERSION = b"0"
 
-RE = br"(\[!)?" br"\[MFLOG\|" br"(0)\|" br"(.+?)Z\|" br"(.+?)\|" br"(.+?)\]" br"(.*)"
+RE = rb"(\[!)?" rb"\[MFLOG\|" rb"(0)\|" rb"(.+?)Z\|" rb"(.+?)\|" rb"(.+?)\]" rb"(.*)"
 
 # the RE groups defined above must match the MFLogline fields below
 # except utc_timestamp, which is filled in by the parser based on utc_tstamp_str
@@ -135,7 +135,13 @@ def merge_logs(logs):
                 missing.append(line)
         for line in missing:
             res = MFLogline(
-                False, None, MISSING_TIMESTAMP_STR, None, None, line, MISSING_TIMESTAMP
+                False,
+                None,
+                MISSING_TIMESTAMP_STR.encode("utf-8"),
+                None,
+                None,
+                line,
+                MISSING_TIMESTAMP,
             )
             yield res.utc_tstamp_str, res
 

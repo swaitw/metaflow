@@ -22,13 +22,15 @@ class CurrentSingletonTest(MetaflowTest):
         self.flow_names = {current.flow_name}
         self.run_ids = {current.run_id}
         self.origin_run_ids = {current.origin_run_id}
-        self.steps = {current.step_name}
+        self.seen_steps = {current.step_name}
         self.step_name = current.step_name
         self.namespaces = {current.namespace}
         self.usernames = {current.username}
         self.uuid = str(uuid4())
         self.task_data = {current.pathspec: self.uuid}
         self.tags = current.tags
+        self.task_obj = current.task
+        self.run_obj = current.run
 
     @steps(1, ["join"])
     def step_join(self):
@@ -47,7 +49,7 @@ class CurrentSingletonTest(MetaflowTest):
         self.flow_names = set(chain(*(i.flow_names for i in inputs)))
         self.run_ids = set(chain(*(i.run_ids for i in inputs)))
         self.origin_run_ids = set(chain(*(i.origin_run_ids for i in inputs)))
-        self.steps = set(chain(*(i.steps for i in inputs)))
+        self.seen_steps = set(chain(*(i.seen_steps for i in inputs)))
         self.namespaces = set(chain(*(i.namespaces for i in inputs)))
         self.usernames = set(chain(*(i.usernames for i in inputs)))
         self.task_data = {}
@@ -66,10 +68,12 @@ class CurrentSingletonTest(MetaflowTest):
         self.origin_run_ids.add(current.origin_run_id)
         self.namespaces.add(current.namespace)
         self.usernames.add(current.username)
-        self.steps.add(current.step_name)
+        self.seen_steps.add(current.step_name)
         self.uuid = str(uuid4())
         self.task_data[current.pathspec] = self.uuid
         self.tags.update(current.tags)
+        self.task_obj = current.task
+        self.run_obj = current.run
 
     @steps(2, ["all"])
     def step_all(self):
@@ -86,13 +90,18 @@ class CurrentSingletonTest(MetaflowTest):
         self.namespaces.add(current.namespace)
         self.usernames.add(current.username)
         self.step_name = current.step_name
-        self.steps.add(current.step_name)
+        self.seen_steps.add(current.step_name)
         self.uuid = str(uuid4())
         self.task_data[current.pathspec] = self.uuid
         self.tags.update(current.tags)
+        self.task_obj = current.task
+        self.run_obj = current.run
 
     def check_results(self, flow, checker):
         run = checker.get_run()
+        from metaflow import get_namespace
+
+        checker_namespace = get_namespace()
         if run is None:
             # very basic sanity check for CLI
             for step in flow:
@@ -101,16 +110,33 @@ class CurrentSingletonTest(MetaflowTest):
                     step.name, "project_names", {"current_singleton"}
                 )
         else:
-            from metaflow import Task
+            from metaflow import Task, namespace
 
             task_data = run.data.task_data
             for pathspec, uuid in task_data.items():
                 assert_equals(Task(pathspec).data.uuid, uuid)
+
+            # Override the namespace for the pickling/unpickling checks
+            namespace("non-existent-namespace-to-test-namespacecheck")
             for step in run:
                 for task in step:
                     assert_equals(task.data.step_name, step.id)
                     pathspec = "/".join(task.pathspec.split("/")[-4:])
                     assert_equals(task.data.uuid, task_data[pathspec])
+                    assert_equals(task.data.task_obj.pathspec, task.pathspec)
+                    # Check we can go up and down pickled objects even in a different
+                    # namespace
+                    # NOTA: task.data.parent (which is what this used to be) DOES NOT
+                    # work since the `.data` object is a MetaflowData object which does
+                    # NOT have a parent attribute (and probably shouldn't as it would
+                    # conflict with a `parent` artifact)
+                    assert_equals(task.parent.parent.id, task.data.run_obj.id)
+                    assert_equals(
+                        task.data.run_obj[task.data.step_name].id, task.data.step_name
+                    )
+            # Restore the original namespace back for these tests
+            namespace(checker_namespace)
+            assert_equals(run.data.run_obj.pathspec, run.pathspec)
             assert_equals(run.data.project_names, {"current_singleton"})
             assert_equals(run.data.branch_names, {"user.tester"})
             assert_equals(

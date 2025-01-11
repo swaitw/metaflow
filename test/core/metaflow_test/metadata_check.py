@@ -150,7 +150,7 @@ class MetadataCheck(MetaflowCheck):
             card_iter = None
         card_data = None
         # Since there are many cards possible for a taskspec, we check for hash to assert a single card.
-        # If the id argument is present then there will be a single cards anyways.
+        # If the id argument is present then there will be a single cards anyway.
         if card_iter is not None:
             if len(card_iter) > 0:
                 if card_hash is None:
@@ -166,6 +166,24 @@ class MetadataCheck(MetaflowCheck):
                 % (self.run_id, step, card_type, repr(value), repr(card_data))
             )
         return True
+
+    def get_card_data(self, step, task, card_type, card_id=None):
+        """
+        returns : (card_present, card_data)
+        """
+        from metaflow.plugins.cards.exception import CardNotPresentException
+
+        try:
+            card_iter = self.get_card(step, task, card_type, card_id=card_id)
+        except CardNotPresentException:
+            return False, None
+        if card_id is None:
+            # Return the first piece of card_data we can find.
+            return True, card_iter[0].get_data()
+        for card in card_iter:
+            if card.id == card_id:
+                return True, card.get_data()
+        return False, None
 
     def get_log(self, step, logtype):
         return "".join(getattr(task, logtype) for task in self.run[step])

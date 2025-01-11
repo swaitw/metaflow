@@ -1,53 +1,64 @@
-from io import BytesIO
 import json
 import os
 import random
 import string
 import sys
 from datetime import datetime, timedelta
-from metaflow.includefile import FilePathClass
+from io import BytesIO
 
 import metaflow.util as util
+from metaflow import current
 from metaflow.decorators import flow_decorators
 from metaflow.exception import MetaflowException
+from metaflow.includefile import FilePathClass
 from metaflow.metaflow_config import (
-    BATCH_METADATA_SERVICE_HEADERS,
-    BATCH_METADATA_SERVICE_URL,
-    DATASTORE_CARD_S3ROOT,
+    AIRFLOW_KUBERNETES_CONN_ID,
+    AIRFLOW_KUBERNETES_KUBECONFIG_CONTEXT,
+    AIRFLOW_KUBERNETES_KUBECONFIG_FILE,
+    AIRFLOW_KUBERNETES_STARTUP_TIMEOUT_SECONDS,
+    AWS_SECRETS_MANAGER_DEFAULT_REGION,
+    GCP_SECRET_MANAGER_PREFIX,
+    AZURE_STORAGE_BLOB_SERVICE_ENDPOINT,
+    CARD_AZUREROOT,
+    CARD_GSROOT,
+    CARD_S3ROOT,
+    DATASTORE_SYSROOT_AZURE,
+    DATASTORE_SYSROOT_GS,
     DATASTORE_SYSROOT_S3,
     DATATOOLS_S3ROOT,
-    KUBERNETES_SERVICE_ACCOUNT,
+    DEFAULT_SECRETS_BACKEND_TYPE,
     KUBERNETES_SECRETS,
-    AIRFLOW_KUBERNETES_STARTUP_TIMEOUT,
-    AZURE_STORAGE_BLOB_SERVICE_ENDPOINT,
-    DATASTORE_SYSROOT_AZURE,
-    DATASTORE_CARD_AZUREROOT,
-    AIRFLOW_KUBERNETES_CONN_ID,
+    KUBERNETES_SERVICE_ACCOUNT,
+    S3_ENDPOINT_URL,
+    SERVICE_HEADERS,
+    SERVICE_INTERNAL_URL,
+    AZURE_KEY_VAULT_PREFIX,
 )
-from metaflow.parameters import DelayedEvaluationParameter, deploy_time_eval
-from metaflow.plugins.kubernetes.kubernetes import Kubernetes
+
+from metaflow.metaflow_config_funcs import config_values
+
+from metaflow.parameters import (
+    DelayedEvaluationParameter,
+    JSONTypeClass,
+    deploy_time_eval,
+)
 
 # TODO: Move chevron to _vendor
 from metaflow.plugins.cards.card_modules import chevron
+from metaflow.plugins.kubernetes.kubernetes import Kubernetes
+from metaflow.plugins.kubernetes.kube_utils import qos_requests_and_limits
 from metaflow.plugins.timeout_decorator import get_run_time_limit_for_task
-from metaflow.util import dict_to_cli_options, get_username, compress_list
-from metaflow.parameters import JSONTypeClass
+from metaflow.util import compress_list, dict_to_cli_options, get_username
 
 from . import airflow_utils
+from .airflow_utils import AIRFLOW_MACROS, TASK_ID_XCOM_KEY, AirflowTask, Workflow
 from .exception import AirflowException
-from .airflow_utils import (
-    TASK_ID_XCOM_KEY,
-    AirflowTask,
-    Workflow,
-    AIRFLOW_MACROS,
-)
-from metaflow import current
+from .sensors import SUPPORTED_SENSORS
 
 AIRFLOW_DEPLOY_TEMPLATE_FILE = os.path.join(os.path.dirname(__file__), "dag.py")
 
 
 class Airflow(object):
-
     TOKEN_STORAGE_ROOT = "mf.airflow"
 
     def __init__(
@@ -88,6 +99,7 @@ class Airflow(object):
         self.username = username
         self.max_workers = max_workers
         self.description = description
+        self._depends_on_upstream_sensors = False
         self._file_path = file_path
         _, self.graph_structure = self.graph.output_steps()
         self.worker_pool = worker_pool
@@ -101,11 +113,10 @@ class Airflow(object):
     @classmethod
     def get_existing_deployment(cls, name, flow_datastore):
         _backend = flow_datastore._storage_impl
-        token_paths = _backend.list_content([cls.get_token_path(name)])
-        if len(token_paths) == 0:
+        token_exists = _backend.is_file([cls.get_token_path(name)])
+        if not token_exists[0]:
             return None
-
-        with _backend.load_bytes([token_paths[0]]) as get_results:
+        with _backend.load_bytes([cls.get_token_path(name)]) as get_results:
             for _, path, _ in get_results:
                 if path is not None:
                     with open(path, "r") as f:
@@ -117,12 +128,12 @@ class Airflow(object):
         return os.path.join(cls.TOKEN_STORAGE_ROOT, name)
 
     @classmethod
-    def save_deployment_token(cls, owner, token, flow_datastore):
+    def save_deployment_token(cls, owner, name, token, flow_datastore):
         _backend = flow_datastore._storage_impl
         _backend.save_bytes(
             [
                 (
-                    cls.get_token_path(token),
+                    cls.get_token_path(name),
                     BytesIO(
                         bytes(
                             json.dumps({"production_token": token, "owner": owner}),
@@ -140,6 +151,7 @@ class Airflow(object):
         schedule = self.flow._flow_decorators.get("schedule")
         if not schedule:
             return None
+        schedule = schedule[0]
         if schedule.attributes["cron"]:
             return schedule.attributes["cron"]
         elif schedule.attributes["weekly"]:
@@ -198,7 +210,7 @@ class Airflow(object):
 
             # Since we will always have a default value and `deploy_time_eval` resolved that to an actual value
             # we can just use the `default` to infer the object's type.
-            # This avoids parsing/indentifying types like `JSONType` or `FilePathClass`
+            # This avoids parsing/identifying types like `JSONType` or `FilePathClass`
             # which are returned by calling `param.kwargs.get("type")`
             param_type = type(airflow_param["default"])
 
@@ -220,11 +232,11 @@ class Airflow(object):
         steps,
     ):
         """
-        This function is meant to compress the input paths and it specifically doesn't use
-        `metaflow.util.compress_list` under the hood. The reason is because the `AIRFLOW_MACROS.RUN_ID` is a complicated macro string
-        that doesn't behave nicely with `metaflow.util.decompress_list` since the `decompress_util`
-        function expects a string which doesn't contain any delimiter characters and the run-id string does.
-        Hence we have a custom compression string created via `_compress_input_path` function instead of `compress_list`.
+        This function is meant to compress the input paths, and it specifically doesn't use
+        `metaflow.util.compress_list` under the hood. The reason is that the `AIRFLOW_MACROS.RUN_ID` is a complicated
+        macro string that doesn't behave nicely with `metaflow.util.decompress_list`, since the `decompress_util`
+        function expects a string which doesn't contain any delimiter characters and the run-id string does. Hence, we
+        have a custom compression string created via `_compress_input_path` function instead of `compress_list`.
         """
         return "%s:" % (AIRFLOW_MACROS.RUN_ID) + ",".join(
             self._make_input_path(step, only_task_id=True) for step in steps
@@ -244,7 +256,8 @@ class Airflow(object):
     def _make_input_path(self, step_name, only_task_id=False):
         """
         This is set using the `airflow_internal` decorator to help pass state.
-        This will pull the `TASK_ID_XCOM_KEY` xcom which holds task-ids. The key is set via the `MetaflowKubernetesOperator`.
+        This will pull the `TASK_ID_XCOM_KEY` xcom which holds task-ids.
+        The key is set via the `MetaflowKubernetesOperator`.
         """
         task_id_string = "/%s/{{ task_instance.xcom_pull(task_ids='%s',key='%s') }}" % (
             step_name,
@@ -261,14 +274,16 @@ class Airflow(object):
         """
         This function will transform the node's specification into Airflow compatible operator arguments.
         Since this function is long, below is the summary of the two major duties it performs:
-            1. Based on the type of the graph node (start/linear/foreach/join etc.) it will decide how to set the input paths
-            2. Based on node's decorator specification convert the information into a job spec for the KubernetesPodOperator.
+            1. Based on the type of the graph node (start/linear/foreach/join etc.)
+                it will decide how to set the input paths
+            2. Based on node's decorator specification convert the information into
+                a job spec for the KubernetesPodOperator.
         """
         # Add env vars from the optional @environment decorator.
         env_deco = [deco for deco in node.decorators if deco.name == "environment"]
         env = {}
         if env_deco:
-            env = env_deco[0].attributes["vars"]
+            env = env_deco[0].attributes["vars"].copy()
 
         # The below if/else block handles "input paths".
         # Input Paths help manage dataflow across the graph.
@@ -304,7 +319,8 @@ class Airflow(object):
                 # One key thing about xcoms is that they are immutable and only accepted if the task
                 # doesn't fail.
                 # From airflow docs :
-                # "Note: If the first task run is not succeeded then on every retry task XComs will be cleared to make the task run idempotent."
+                # "Note: If the first task run is not succeeded then on every retry task
+                # XComs will be cleared to make the task run idempotent."
                 input_paths = self._make_input_path(node.in_funcs[0])
             else:
                 # this is a split scenario where there can be more than one input paths.
@@ -325,6 +341,16 @@ class Airflow(object):
         metaflow_version["production_token"] = self.production_token
         env["METAFLOW_VERSION"] = json.dumps(metaflow_version)
 
+        # Temporary passing of *some* environment variables. Do not rely on this
+        # mechanism as it will be removed in the near future
+        env.update(
+            {
+                k: v
+                for k, v in config_values()
+                if k.startswith("METAFLOW_CONDA_") or k.startswith("METAFLOW_DEBUG_")
+            }
+        )
+
         # Extract the k8s decorators for constructing the arguments of the K8s Pod Operator on Airflow.
         k8s_deco = [deco for deco in node.decorators if deco.name == "kubernetes"][0]
         user_code_retries, _ = self._get_retries(node)
@@ -341,7 +367,8 @@ class Airflow(object):
             "app.kubernetes.io/name": "metaflow-task",
             "app.kubernetes.io/part-of": "metaflow",
             "app.kubernetes.io/created-by": user,
-            # Question to (savin) : Should we have username set over here for created by since it is the airflow installation that is creating the jobs.
+            # Question to (savin) : Should we have username set over here for created by since it is the
+            # airflow installation that is creating the jobs.
             # Technically the "user" is the stakeholder but should these labels be present.
         }
         additional_mf_variables = {
@@ -349,17 +376,17 @@ class Airflow(object):
             "METAFLOW_CODE_URL": self.code_package_url,
             "METAFLOW_CODE_DS": self.flow_datastore.TYPE,
             "METAFLOW_USER": user,
-            "METAFLOW_SERVICE_URL": BATCH_METADATA_SERVICE_URL,
-            "METAFLOW_SERVICE_HEADERS": json.dumps(BATCH_METADATA_SERVICE_HEADERS),
+            "METAFLOW_SERVICE_URL": SERVICE_INTERNAL_URL,
+            "METAFLOW_SERVICE_HEADERS": json.dumps(SERVICE_HEADERS),
             "METAFLOW_DATASTORE_SYSROOT_S3": DATASTORE_SYSROOT_S3,
             "METAFLOW_DATATOOLS_S3ROOT": DATATOOLS_S3ROOT,
-            "METAFLOW_DEFAULT_DATASTORE": "s3",
+            "METAFLOW_DEFAULT_DATASTORE": self.flow_datastore.TYPE,
             "METAFLOW_DEFAULT_METADATA": "service",
             "METAFLOW_KUBERNETES_WORKLOAD": str(
                 1
             ),  # This is used by kubernetes decorator.
             "METAFLOW_RUNTIME_ENVIRONMENT": "kubernetes",
-            "METAFLOW_CARD_S3ROOT": DATASTORE_CARD_S3ROOT,
+            "METAFLOW_CARD_S3ROOT": CARD_S3ROOT,
             "METAFLOW_RUN_ID": AIRFLOW_MACROS.RUN_ID,
             "METAFLOW_AIRFLOW_TASK_ID": AIRFLOW_MACROS.create_task_id(
                 self.contains_foreach
@@ -368,12 +395,28 @@ class Airflow(object):
             "METAFLOW_AIRFLOW_JOB_ID": AIRFLOW_MACROS.AIRFLOW_JOB_ID,
             "METAFLOW_PRODUCTION_TOKEN": self.production_token,
             "METAFLOW_ATTEMPT_NUMBER": AIRFLOW_MACROS.ATTEMPT,
+            # GCP stuff
+            "METAFLOW_DATASTORE_SYSROOT_GS": DATASTORE_SYSROOT_GS,
+            "METAFLOW_CARD_GSROOT": CARD_GSROOT,
+            "METAFLOW_S3_ENDPOINT_URL": S3_ENDPOINT_URL,
         }
-        env[
-            "METAFLOW_AZURE_STORAGE_BLOB_SERVICE_ENDPOINT"
-        ] = AZURE_STORAGE_BLOB_SERVICE_ENDPOINT
+        env["METAFLOW_AZURE_STORAGE_BLOB_SERVICE_ENDPOINT"] = (
+            AZURE_STORAGE_BLOB_SERVICE_ENDPOINT
+        )
         env["METAFLOW_DATASTORE_SYSROOT_AZURE"] = DATASTORE_SYSROOT_AZURE
-        env["METAFLOW_DATASTORE_CARD_AZUREROOT"] = DATASTORE_CARD_AZUREROOT
+        env["METAFLOW_CARD_AZUREROOT"] = CARD_AZUREROOT
+        if DEFAULT_SECRETS_BACKEND_TYPE:
+            env["METAFLOW_DEFAULT_SECRETS_BACKEND_TYPE"] = DEFAULT_SECRETS_BACKEND_TYPE
+        if AWS_SECRETS_MANAGER_DEFAULT_REGION:
+            env["METAFLOW_AWS_SECRETS_MANAGER_DEFAULT_REGION"] = (
+                AWS_SECRETS_MANAGER_DEFAULT_REGION
+            )
+        if GCP_SECRET_MANAGER_PREFIX:
+            env["METAFLOW_GCP_SECRET_MANAGER_PREFIX"] = GCP_SECRET_MANAGER_PREFIX
+
+        if AZURE_KEY_VAULT_PREFIX:
+            env["METAFLOW_AZURE_KEY_VAULT_PREFIX"] = AZURE_KEY_VAULT_PREFIX
+
         env.update(additional_mf_variables)
 
         service_account = (
@@ -386,25 +429,25 @@ class Airflow(object):
             if k8s_deco.attributes["namespace"] is not None
             else "default"
         )
-
-        resources = dict(
-            requests={
-                "cpu": k8s_deco.attributes["cpu"],
-                "memory": "%sM" % str(k8s_deco.attributes["memory"]),
-                "ephemeral-storage": str(k8s_deco.attributes["disk"]),
-            }
+        qos_requests, qos_limits = qos_requests_and_limits(
+            k8s_deco.attributes["qos"],
+            k8s_deco.attributes["cpu"],
+            k8s_deco.attributes["memory"],
+            k8s_deco.attributes["disk"],
         )
-        if k8s_deco.attributes["gpu"] is not None:
-            resources.update(
-                dict(
-                    limits={
-                        "%s.com/gpu".lower()
-                        % k8s_deco.attributes["gpu_vendor"]: str(
-                            k8s_deco.attributes["gpu"]
-                        )
-                    }
-                )
-            )
+        resources = dict(
+            requests=qos_requests,
+            limits={
+                **qos_limits,
+                **{
+                    "%s.com/gpu".lower()
+                    % k8s_deco.attributes["gpu_vendor"]: str(k8s_deco.attributes["gpu"])
+                    for k in [0]
+                    # Don't set GPU limits if gpu isn't specified.
+                    if k8s_deco.attributes["gpu"] is not None
+                },
+            },
+        )
 
         annotations = {
             "metaflow/production_token": self.production_token,
@@ -446,7 +489,7 @@ class Airflow(object):
             env_vars=[dict(name=k, value=v) for k, v in env.items() if v is not None],
             labels=labels,
             task_id=node.name,
-            startup_timeout_seconds=AIRFLOW_KUBERNETES_STARTUP_TIMEOUT,
+            startup_timeout_seconds=AIRFLOW_KUBERNETES_STARTUP_TIMEOUT_SECONDS,
             get_logs=True,
             do_xcom_push=True,
             log_events_on_failure=True,
@@ -455,10 +498,16 @@ class Airflow(object):
             reattach_on_restart=False,
             secrets=[],
         )
+        k8s_operator_args["in_cluster"] = True
         if AIRFLOW_KUBERNETES_CONN_ID is not None:
             k8s_operator_args["kubernetes_conn_id"] = AIRFLOW_KUBERNETES_CONN_ID
-        else:
-            k8s_operator_args["in_cluster"] = True
+            k8s_operator_args["in_cluster"] = False
+        if AIRFLOW_KUBERNETES_KUBECONFIG_CONTEXT is not None:
+            k8s_operator_args["cluster_context"] = AIRFLOW_KUBERNETES_KUBECONFIG_CONTEXT
+            k8s_operator_args["in_cluster"] = False
+        if AIRFLOW_KUBERNETES_KUBECONFIG_FILE is not None:
+            k8s_operator_args["config_file"] = AIRFLOW_KUBERNETES_KUBECONFIG_FILE
+            k8s_operator_args["in_cluster"] = False
 
         if k8s_deco.attributes["secrets"]:
             if isinstance(k8s_deco.attributes["secrets"], str):
@@ -491,7 +540,7 @@ class Airflow(object):
         # FlowDecorators can define their own top-level options. They are
         # responsible for adding their own top-level options and values through
         # the get_top_level_options() hook. See similar logic in runtime.py.
-        for deco in flow_decorators():
+        for deco in flow_decorators(self.flow):
             top_opts_dict.update(deco.get_top_level_options())
 
         top_opts = list(dict_to_cli_options(top_opts_dict))
@@ -539,7 +588,7 @@ class Airflow(object):
                 params.extend("--tag %s" % tag for tag in self.tags)
 
             # If the start step gets retried, we must be careful not to
-            # regenerate multiple parameters tasks. Hence we check first if
+            # regenerate multiple parameters tasks. Hence, we check first if
             # _parameters exists already.
             exists = entrypoint + [
                 # Dump the parameters task
@@ -579,6 +628,17 @@ class Airflow(object):
         cmds.append(" ".join(entrypoint + top_level + step))
         return cmds
 
+    def _collect_flow_sensors(self):
+        decos_lists = [
+            self.flow._flow_decorators.get(s.name)
+            for s in SUPPORTED_SENSORS
+            if self.flow._flow_decorators.get(s.name) is not None
+        ]
+        af_tasks = [deco.create_task() for decos in decos_lists for deco in decos]
+        if len(af_tasks) > 0:
+            self._depends_on_upstream_sensors = True
+        return af_tasks
+
     def _contains_foreach(self):
         for node in self.graph:
             if node.type == "foreach":
@@ -586,8 +646,36 @@ class Airflow(object):
         return False
 
     def compile(self):
+        if self.flow._flow_decorators.get("trigger") or self.flow._flow_decorators.get(
+            "trigger_on_finish"
+        ):
+            raise AirflowException(
+                "Deploying flows with @trigger or @trigger_on_finish decorator(s) "
+                "to Airflow is not supported currently."
+            )
+
         # Visit every node of the flow and recursively build the state machine.
         def _visit(node, workflow, exit_node=None):
+            kube_deco = dict(
+                [deco for deco in node.decorators if deco.name == "kubernetes"][
+                    0
+                ].attributes
+            )
+            if kube_deco:
+                # Only guard against use_tmpfs and tmpfs_size as these determine if tmpfs is enabled.
+                for attr in [
+                    "use_tmpfs",
+                    "tmpfs_size",
+                    "persistent_volume_claims",
+                    "image_pull_policy",
+                ]:
+                    if kube_deco[attr]:
+                        raise AirflowException(
+                            "The decorator attribute *%s* is currently not supported on Airflow "
+                            "for the @kubernetes decorator on step *%s*"
+                            % (attr, node.name)
+                        )
+
             parent_is_foreach = any(  # Any immediate parent is a foreach node.
                 self.graph[n].type == "foreach" for n in node.in_funcs
             )
@@ -633,6 +721,7 @@ class Airflow(object):
         if self.workflow_timeout is not None and self.schedule is not None:
             airflow_dag_args["dagrun_timeout"] = dict(seconds=self.workflow_timeout)
 
+        appending_sensors = self._collect_flow_sensors()
         workflow = Workflow(
             dag_id=self.name,
             default_args=self._create_defaults(),
@@ -653,6 +742,10 @@ class Airflow(object):
         workflow = _visit(self.graph["start"], workflow)
 
         workflow.set_parameters(self.parameters)
+        if len(appending_sensors) > 0:
+            for s in appending_sensors:
+                workflow.add_state(s)
+            workflow.graph_structure.insert(0, [[s.name] for s in appending_sensors])
         return self._to_airflow_dag_file(workflow.to_dict())
 
     def _to_airflow_dag_file(self, json_dag):
@@ -674,7 +767,8 @@ class Airflow(object):
     def _create_defaults(self):
         defu_ = {
             "owner": get_username(),
-            # If set on a task, doesn’t run the task in the current DAG run if the previous run of the task has failed.
+            # If set on a task and the previous run of the task has failed,
+            # it will not run the task in the current DAG run.
             "depends_on_past": False,
             # TODO: Enable emails
             "execution_timeout": timedelta(days=5),

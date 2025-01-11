@@ -8,7 +8,8 @@ class TagCatchTest(MetaflowTest):
     @tag("retry(times=3)")
     @steps(0, ["start"])
     def step_start(self):
-        import os, sys
+        import os
+        import sys
 
         self.test_attempt = current.retry_count
         sys.stdout.write("stdout testing logs %d\n" % self.test_attempt)
@@ -54,7 +55,8 @@ class TagCatchTest(MetaflowTest):
     @tag("retry(times=2)")
     @steps(1, ["all"])
     def step_all(self):
-        import signal, os
+        import signal
+        import os
 
         # die an ugly death
         os.kill(os.getpid(), signal.SIGKILL)
@@ -119,7 +121,9 @@ class TagCatchTest(MetaflowTest):
                     data = task.data
                     got = sorted(m.value for m in task.metadata if m.type == "attempt")
                     if flow._graph[step.id].parallel_step:
-                        if "control" in task.id:
+                        if task.metadata_dict.get(
+                            "internal_task_type", None
+                        ):  # Only control tasks have internal_task_type set
                             assert_equals(list(map(str, range(attempts))), got)
                         else:
                             # non-control tasks have one attempt less for parallel steps

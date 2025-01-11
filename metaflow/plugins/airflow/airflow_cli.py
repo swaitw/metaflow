@@ -1,30 +1,30 @@
+import base64
 import os
 import re
 import sys
-import base64
+from hashlib import sha1
+
 from metaflow import current, decorators
 from metaflow._vendor import click
 from metaflow.exception import MetaflowException, MetaflowInternalError
 from metaflow.package import MetaflowPackage
-from hashlib import sha1
-from metaflow.plugins import KubernetesDecorator
-from metaflow.util import get_username, to_bytes, to_unicode
-
-from .airflow import Airflow
-from .exception import AirflowException, NotSupportedException
-
 from metaflow.plugins.aws.step_functions.production_token import (
     load_token,
     new_token,
     store_token,
 )
+from metaflow.plugins.kubernetes.kubernetes_decorator import KubernetesDecorator
+from metaflow.util import get_username, to_bytes, to_unicode
+
+from .airflow import Airflow
+from .exception import AirflowException, NotSupportedException
 
 
 class IncorrectProductionToken(MetaflowException):
     headline = "Incorrect production token"
 
 
-VALID_NAME = re.compile("[^a-zA-Z0-9_\-\.]")
+VALID_NAME = re.compile(r"[^a-zA-Z0-9_\-\.]")
 
 
 def resolve_token(
@@ -101,7 +101,7 @@ def resolve_token(
                 )
         obj.echo("")
         obj.echo("A new production token generated.")
-        Airflow.save_deployment_token(get_username(), token, obj.flow_datastore)
+        Airflow.save_deployment_token(get_username(), name, token, obj.flow_datastore)
     else:
         token = prev_token
 
@@ -283,6 +283,7 @@ def make_flow(
 ):
     # Attach @kubernetes.
     decorators._attach_decorators(obj.flow, [KubernetesDecorator.name])
+    decorators._init(obj.flow)
 
     decorators._init_step_decorators(
         obj.flow, obj.graph, obj.environment, obj.flow_datastore, obj.logger
@@ -322,11 +323,11 @@ def make_flow(
 
 
 def _validate_foreach_constraints(graph):
-    # Todo :Invoke this function when we integrate foreach's
     def traverse_graph(node, state):
         if node.type == "foreach" and node.is_inside_foreach:
             raise NotSupportedException(
-                "Step *%s* is a foreach step called within a foreach step. This type of graph is currently not supported with Airflow."
+                "Step *%s* is a foreach step called within a foreach step. "
+                "This type of graph is currently not supported with Airflow."
                 % node.name
             )
 
@@ -337,9 +338,9 @@ def _validate_foreach_constraints(graph):
             if node.type == "linear" and node.is_inside_foreach:
                 state["foreach_stack"].append(node.name)
 
-            if len(state["foreach_stack"]) > 2:
+            if "foreach_stack" in state and len(state["foreach_stack"]) > 2:
                 raise NotSupportedException(
-                    "The foreach step *%s* created by step *%s* needs to have an immidiate join step. "
+                    "The foreach step *%s* created by step *%s* needs to have an immediate join step. "
                     "Step *%s* is invalid since it is a linear step with a foreach. "
                     "This type of graph is currently not supported with Airflow."
                     % (
@@ -372,32 +373,47 @@ def _validate_workflow(flow, graph, flow_datastore, metadata, workflow_timeout):
         seen.add(norm)
         if "default" not in param.kwargs:
             raise MetaflowException(
-                "Parameter *%s* does not have a "
-                "default value. "
+                "Parameter *%s* does not have a default value. "
                 "A default value is required for parameters when deploying flows on Airflow."
+                % param.name
             )
     # check for other compute related decorators.
+    _validate_foreach_constraints(graph)
     for node in graph:
         if node.parallel_foreach:
             raise AirflowException(
                 "Deploying flows with @parallel decorator(s) "
                 "to Airflow is not supported currently."
             )
-
-        if node.type == "foreach":
-            raise NotSupportedException(
-                "Step *%s* is a foreach step and Foreach steps are not currently supported with Airflow."
-                % node.name
-            )
         if any([d.name == "batch" for d in node.decorators]):
             raise NotSupportedException(
                 "Step *%s* is marked for execution on AWS Batch with Airflow which isn't currently supported."
                 % node.name
             )
-
-    if flow_datastore.TYPE not in ("azure", "s3"):
+        if any([d.name == "slurm" for d in node.decorators]):
+            raise NotSupportedException(
+                "Step *%s* is marked for execution on Slurm with Airflow which isn't currently supported."
+                % node.name
+            )
+    SUPPORTED_DATASTORES = ("azure", "s3", "gs")
+    if flow_datastore.TYPE not in SUPPORTED_DATASTORES:
         raise AirflowException(
-            'Datastore of type "s3" or "azure" required with `airflow create`'
+            "Datastore type `%s` is not supported with `airflow create`. "
+            "Please choose from datastore of type %s when calling `airflow create`"
+            % (
+                str(flow_datastore.TYPE),
+                "or ".join(["`%s`" % x for x in SUPPORTED_DATASTORES]),
+            )
+        )
+
+    schedule = flow._flow_decorators.get("schedule")
+    if not schedule:
+        return
+
+    schedule = schedule[0]
+    if schedule.timezone is not None:
+        raise AirflowException(
+            "`airflow create` does not support scheduling with `timezone`."
         )
 
 

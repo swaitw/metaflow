@@ -7,18 +7,26 @@ import shlex
 import time
 
 from metaflow import util
-from metaflow.datatools.s3tail import S3Tail
+from metaflow.plugins.datatools.s3.s3tail import S3Tail
+from metaflow.plugins.aws.aws_utils import sanitize_batch_tag
 from metaflow.exception import MetaflowException
 from metaflow.metaflow_config import (
-    BATCH_METADATA_SERVICE_URL,
+    OTEL_ENDPOINT,
+    SERVICE_INTERNAL_URL,
     DATATOOLS_S3ROOT,
     DATASTORE_SYSROOT_S3,
     DEFAULT_METADATA,
-    BATCH_METADATA_SERVICE_HEADERS,
+    SERVICE_HEADERS,
     BATCH_EMIT_TAGS,
-    DATASTORE_CARD_S3ROOT,
+    CARD_S3ROOT,
     S3_ENDPOINT_URL,
+    DEFAULT_SECRETS_BACKEND_TYPE,
+    AWS_SECRETS_MANAGER_DEFAULT_REGION,
+    S3_SERVER_SIDE_ENCRYPTION,
 )
+
+from metaflow.metaflow_config_funcs import config_values
+
 from metaflow.mflog import (
     export_mflog_env_vars,
     bash_capture_logs,
@@ -173,10 +181,20 @@ class Batch(object):
         shared_memory=None,
         max_swap=None,
         swappiness=None,
+        inferentia=None,
+        efa=None,
         env={},
         attrs={},
         host_volumes=None,
+        efs_volumes=None,
+        use_tmpfs=None,
+        tmpfs_tempdir=None,
+        tmpfs_size=None,
+        tmpfs_path=None,
         num_parallel=0,
+        ephemeral_storage=None,
+        log_driver=None,
+        log_options=None,
     ):
         job_name = self._job_name(
             attrs.get("metaflow.user"),
@@ -198,6 +216,15 @@ class Batch(object):
             .image(image)
             .iam_role(iam_role)
             .execution_role(execution_role)
+            .cpu(cpu)
+            .gpu(gpu)
+            .memory(memory)
+            .shared_memory(shared_memory)
+            .max_swap(max_swap)
+            .swappiness(swappiness)
+            .inferentia(inferentia)
+            .efa(efa)
+            .timeout_in_secs(run_time_limit)
             .job_def(
                 image,
                 iam_role,
@@ -206,33 +233,65 @@ class Batch(object):
                 shared_memory,
                 max_swap,
                 swappiness,
+                inferentia,
+                efa,
+                memory=memory,
                 host_volumes=host_volumes,
+                efs_volumes=efs_volumes,
+                use_tmpfs=use_tmpfs,
+                tmpfs_tempdir=tmpfs_tempdir,
+                tmpfs_size=tmpfs_size,
+                tmpfs_path=tmpfs_path,
                 num_parallel=num_parallel,
+                ephemeral_storage=ephemeral_storage,
+                log_driver=log_driver,
+                log_options=log_options,
             )
-            .cpu(cpu)
-            .gpu(gpu)
-            .memory(memory)
-            .shared_memory(shared_memory)
-            .max_swap(max_swap)
-            .swappiness(swappiness)
-            .timeout_in_secs(run_time_limit)
             .task_id(attrs.get("metaflow.task_id"))
             .environment_variable("AWS_DEFAULT_REGION", self._client.region())
             .environment_variable("METAFLOW_CODE_SHA", code_package_sha)
             .environment_variable("METAFLOW_CODE_URL", code_package_url)
             .environment_variable("METAFLOW_CODE_DS", code_package_ds)
             .environment_variable("METAFLOW_USER", attrs["metaflow.user"])
-            .environment_variable("METAFLOW_SERVICE_URL", BATCH_METADATA_SERVICE_URL)
+            .environment_variable("METAFLOW_SERVICE_URL", SERVICE_INTERNAL_URL)
             .environment_variable(
-                "METAFLOW_SERVICE_HEADERS", json.dumps(BATCH_METADATA_SERVICE_HEADERS)
+                "METAFLOW_SERVICE_HEADERS", json.dumps(SERVICE_HEADERS)
             )
             .environment_variable("METAFLOW_DATASTORE_SYSROOT_S3", DATASTORE_SYSROOT_S3)
             .environment_variable("METAFLOW_DATATOOLS_S3ROOT", DATATOOLS_S3ROOT)
             .environment_variable("METAFLOW_DEFAULT_DATASTORE", "s3")
             .environment_variable("METAFLOW_DEFAULT_METADATA", DEFAULT_METADATA)
-            .environment_variable("METAFLOW_CARD_S3ROOT", DATASTORE_CARD_S3ROOT)
+            .environment_variable("METAFLOW_CARD_S3ROOT", CARD_S3ROOT)
+            .environment_variable("METAFLOW_OTEL_ENDPOINT", OTEL_ENDPOINT)
             .environment_variable("METAFLOW_RUNTIME_ENVIRONMENT", "aws-batch")
         )
+
+        # Temporary passing of *some* environment variables. Do not rely on this
+        # mechanism as it will be removed in the near future
+        for k, v in config_values():
+            if k.startswith("METAFLOW_CONDA_") or k.startswith("METAFLOW_DEBUG_"):
+                job.environment_variable(k, v)
+
+        if DEFAULT_SECRETS_BACKEND_TYPE is not None:
+            job.environment_variable(
+                "METAFLOW_DEFAULT_SECRETS_BACKEND_TYPE", DEFAULT_SECRETS_BACKEND_TYPE
+            )
+        if AWS_SECRETS_MANAGER_DEFAULT_REGION is not None:
+            job.environment_variable(
+                "METAFLOW_AWS_SECRETS_MANAGER_DEFAULT_REGION",
+                AWS_SECRETS_MANAGER_DEFAULT_REGION,
+            )
+
+        tmpfs_enabled = use_tmpfs or (tmpfs_size and not use_tmpfs)
+
+        if tmpfs_enabled and tmpfs_tempdir:
+            job.environment_variable("METAFLOW_TEMPDIR", tmpfs_path)
+
+        if S3_SERVER_SIDE_ENCRYPTION is not None:
+            job.environment_variable(
+                "METAFLOW_S3_SERVER_SIDE_ENCRYPTION", S3_SERVER_SIDE_ENCRYPTION
+            )
+
         # Skip setting METAFLOW_DATASTORE_SYSROOT_LOCAL because metadata sync between the local user
         # instance and the remote AWS Batch instance assumes metadata is stored in DATASTORE_LOCAL_DIR
         # on the remote AWS Batch instance; this happens when METAFLOW_DATASTORE_SYSROOT_LOCAL
@@ -254,14 +313,20 @@ class Batch(object):
                 "metaflow.flow_name",
                 "metaflow.run_id",
                 "metaflow.step_name",
-                "metaflow.version",
                 "metaflow.run_id.$",
-                "metaflow.user",
-                "metaflow.owner",
                 "metaflow.production_token",
             ]:
                 if key in attrs:
                     job.tag(key, attrs.get(key))
+            # As some values can be affected by users, sanitize them so they adhere to AWS tagging restrictions.
+            for key in [
+                "metaflow.version",
+                "metaflow.user",
+                "metaflow.owner",
+            ]:
+                if key in attrs:
+                    k, v = sanitize_batch_tag(key, attrs.get(key))
+                    job.tag(k, v)
         return job
 
     def launch_job(
@@ -283,10 +348,20 @@ class Batch(object):
         shared_memory=None,
         max_swap=None,
         swappiness=None,
+        inferentia=None,
+        efa=None,
         host_volumes=None,
+        efs_volumes=None,
+        use_tmpfs=None,
+        tmpfs_tempdir=None,
+        tmpfs_size=None,
+        tmpfs_path=None,
         num_parallel=0,
         env={},
         attrs={},
+        ephemeral_storage=None,
+        log_driver=None,
+        log_options=None,
     ):
         if queue is None:
             queue = next(self._client.active_job_queues(), None)
@@ -313,10 +388,20 @@ class Batch(object):
             shared_memory,
             max_swap,
             swappiness,
+            inferentia,
+            efa,
             env=env,
             attrs=attrs,
             host_volumes=host_volumes,
+            efs_volumes=efs_volumes,
+            use_tmpfs=use_tmpfs,
+            tmpfs_tempdir=tmpfs_tempdir,
+            tmpfs_size=tmpfs_size,
+            tmpfs_path=tmpfs_path,
             num_parallel=num_parallel,
+            ephemeral_storage=ephemeral_storage,
+            log_driver=log_driver,
+            log_options=log_options,
         )
         self.num_parallel = num_parallel
         self.job = job.execute()

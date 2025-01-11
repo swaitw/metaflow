@@ -1,5 +1,6 @@
 from metaflow.decorators import FlowDecorator
 
+
 # TODO (savin): Lift this decorator up since it's also used by Argo now
 class ScheduleDecorator(FlowDecorator):
     """
@@ -8,19 +9,28 @@ class ScheduleDecorator(FlowDecorator):
 
     Parameters
     ----------
-    hourly : bool
-        Run the workflow hourly (default: False).
-    daily : bool
-        Run the workflow daily (default: True).
-    weekly : bool
-        Run the workflow weekly (default: False).
-    cron : str
+    hourly : bool, default False
+        Run the workflow hourly.
+    daily : bool, default True
+        Run the workflow daily.
+    weekly : bool, default False
+        Run the workflow weekly.
+    cron : str, optional, default None
         Run the workflow at [a custom Cron schedule](https://docs.aws.amazon.com/eventbridge/latest/userguide/scheduled-events.html#cron-expressions)
         specified by this expression.
+    timezone : str, optional, default None
+        Timezone on which the schedule runs (default: None). Currently supported only for Argo workflows,
+        which accepts timezones in [IANA format](https://nodatime.org/TimeZones).
     """
 
     name = "schedule"
-    defaults = {"cron": None, "weekly": False, "daily": True, "hourly": False}
+    defaults = {
+        "cron": None,
+        "weekly": False,
+        "daily": True,
+        "hourly": False,
+        "timezone": None,
+    }
 
     def flow_init(
         self, flow, graph, environment, flow_datastore, metadata, logger, echo, options
@@ -37,3 +47,6 @@ class ScheduleDecorator(FlowDecorator):
             self.schedule = "0 0 * * ? *"
         else:
             self.schedule = None
+
+        # Argo Workflows supports the IANA timezone standard, e.g. America/Los_Angeles
+        self.timezone = self.attributes["timezone"]

@@ -1,29 +1,33 @@
 import base64
-from metaflow._vendor import click
-from hashlib import sha1
 import json
 import re
-from distutils.version import LooseVersion
+from hashlib import sha1
 
-from metaflow import current, decorators, parameters, JSONType
-from metaflow.metaflow_config import (
-    METADATA_SERVICE_VERSION_CHECK,
-    SFN_STATE_MACHINE_PREFIX,
-)
+from metaflow import JSONType, current, decorators, parameters
+from metaflow._vendor import click
 from metaflow.exception import MetaflowException, MetaflowInternalError
+from metaflow.metaflow_config import (
+    SERVICE_VERSION_CHECK,
+    SFN_STATE_MACHINE_PREFIX,
+    UI_URL,
+)
 from metaflow.package import MetaflowPackage
-from metaflow.plugins import BatchDecorator
+from metaflow.plugins.aws.batch.batch_decorator import BatchDecorator
 from metaflow.tagging_util import validate_tags
-from metaflow.util import get_username, to_bytes, to_unicode
+from metaflow.util import get_username, to_bytes, to_unicode, version_parse
 
+from .production_token import load_token, new_token, store_token
 from .step_functions import StepFunctions
-from .production_token import load_token, store_token, new_token
 
-VALID_NAME = re.compile("[^a-zA-Z0-9_\-\.]")
+VALID_NAME = re.compile(r"[^a-zA-Z0-9_\-\.]")
 
 
 class IncorrectProductionToken(MetaflowException):
     headline = "Incorrect production token"
+
+
+class RunIdMismatch(MetaflowException):
+    headline = "Run ID mismatch"
 
 
 class IncorrectMetadataServiceVersion(MetaflowException):
@@ -120,6 +124,20 @@ def step_functions(obj, name=None):
     help="Log AWS Step Functions execution history to AWS CloudWatch "
     "Logs log group.",
 )
+@click.option(
+    "--use-distributed-map/--no-use-distributed-map",
+    is_flag=True,
+    help="Use AWS Step Functions Distributed Map instead of Inline Map for "
+    "defining foreach tasks in Amazon State Language.",
+)
+@click.option(
+    "--deployer-attribute-file",
+    default=None,
+    show_default=True,
+    type=str,
+    help="Write the workflow name to the file specified. Used internally for Metaflow's Deployer API.",
+    hidden=True,
+)
 @click.pass_obj
 def create(
     obj,
@@ -132,14 +150,34 @@ def create(
     max_workers=None,
     workflow_timeout=None,
     log_execution_history=False,
+    use_distributed_map=False,
+    deployer_attribute_file=None,
 ):
+    for node in obj.graph:
+        if any([d.name == "slurm" for d in node.decorators]):
+            raise MetaflowException(
+                "Step *%s* is marked for execution on Slurm with AWS Step Functions which isn't currently supported."
+                % node.name
+            )
+
     validate_tags(tags)
+
+    if deployer_attribute_file:
+        with open(deployer_attribute_file, "w") as f:
+            json.dump(
+                {
+                    "name": obj.state_machine_name,
+                    "flow_name": obj.flow.name,
+                    "metadata": obj.metadata.metadata_str(),
+                },
+                f,
+            )
 
     obj.echo(
         "Deploying *%s* to AWS Step Functions..." % obj.state_machine_name, bold=True
     )
 
-    if METADATA_SERVICE_VERSION_CHECK:
+    if SERVICE_VERSION_CHECK:
         check_metadata_service_version(obj)
 
     token = resolve_token(
@@ -161,6 +199,7 @@ def create(
         max_workers,
         workflow_timeout,
         obj.is_project,
+        use_distributed_map,
     )
 
     if only_json:
@@ -191,7 +230,7 @@ def check_metadata_service_version(obj):
     version = metadata.version()
     if version == "local":
         return
-    elif version is not None and LooseVersion(version) >= LooseVersion("2.0.2"):
+    elif version is not None and version_parse(version) >= version_parse("2.0.2"):
         # Metaflow metadata service needs to be at least at version 2.0.2
         return
     else:
@@ -219,8 +258,10 @@ def check_metadata_service_version(obj):
 
 
 def resolve_state_machine_name(obj, name):
-    def attach_prefix(name):
-        if SFN_STATE_MACHINE_PREFIX is not None:
+    def attach_prefix(name: str):
+        if SFN_STATE_MACHINE_PREFIX is not None and (
+            not name.startswith(SFN_STATE_MACHINE_PREFIX)
+        ):
             return SFN_STATE_MACHINE_PREFIX + "_" + name
         return name
 
@@ -269,13 +310,22 @@ def resolve_state_machine_name(obj, name):
 
 
 def make_flow(
-    obj, token, name, tags, namespace, max_workers, workflow_timeout, is_project
+    obj,
+    token,
+    name,
+    tags,
+    namespace,
+    max_workers,
+    workflow_timeout,
+    is_project,
+    use_distributed_map,
 ):
     if obj.flow_datastore.TYPE != "s3":
         raise MetaflowException("AWS Step Functions requires --datastore=s3.")
 
     # Attach AWS Batch decorator to the flow
     decorators._attach_decorators(obj.flow, [BatchDecorator.name])
+    decorators._init(obj.flow)
     decorators._init_step_decorators(
         obj.flow, obj.graph, obj.environment, obj.flow_datastore, obj.logger
     )
@@ -305,13 +355,13 @@ def make_flow(
         username=get_username(),
         workflow_timeout=workflow_timeout,
         is_project=is_project,
+        use_distributed_map=use_distributed_map,
     )
 
 
 def resolve_token(
     name, token_prefix, obj, authorize, given_token, generate_new_token, is_project
 ):
-
     # 1) retrieve the previous deployment, if one exists
     workflow = StepFunctions.get_existing_deployment(name)
     if workflow is None:
@@ -420,8 +470,16 @@ def resolve_token(
     type=str,
     help="Write the ID of this run to the file specified.",
 )
+@click.option(
+    "--deployer-attribute-file",
+    default=None,
+    show_default=True,
+    type=str,
+    help="Write the metadata and pathspec of this run to the file specified.\nUsed internally for Metaflow's Deployer API.",
+    hidden=True,
+)
 @click.pass_obj
-def trigger(obj, run_id_file=None, **kwargs):
+def trigger(obj, run_id_file=None, deployer_attribute_file=None, **kwargs):
     def _convert_value(param):
         # Swap `-` with `_` in parameter name to match click's behavior
         val = kwargs.get(param.name.replace("-", "_").lower())
@@ -446,11 +504,32 @@ def trigger(obj, run_id_file=None, **kwargs):
         with open(run_id_file, "w") as f:
             f.write(str(run_id))
 
+    if deployer_attribute_file:
+        with open(deployer_attribute_file, "w") as f:
+            json.dump(
+                {
+                    "name": obj.state_machine_name,
+                    "metadata": obj.metadata.metadata_str(),
+                    "pathspec": "/".join((obj.flow.name, run_id)),
+                },
+                f,
+            )
+
     obj.echo(
         "Workflow *{name}* triggered on AWS Step Functions "
         "(run-id *{run_id}*).".format(name=obj.state_machine_name, run_id=run_id),
         bold=True,
     )
+
+    run_url = (
+        "%s/%s/%s" % (UI_URL.rstrip("/"), obj.flow.name, run_id) if UI_URL else None
+    )
+
+    if run_url:
+        obj.echo(
+            "See the run in the UI at %s" % run_url,
+            bold=True,
+        )
 
 
 @step_functions.command(help="List all runs of the workflow on AWS Step Functions.")
@@ -545,3 +624,179 @@ def list_runs(
                 "No executions for *%s* found on AWS Step Functions."
                 % (obj.state_machine_name)
             )
+
+
+@step_functions.command(help="Delete a workflow")
+@click.option(
+    "--authorize",
+    default=None,
+    type=str,
+    help="Authorize the deletion with a production token",
+)
+@click.pass_obj
+def delete(obj, authorize=None):
+    def _token_instructions(flow_name, prev_user):
+        obj.echo(
+            "There is an existing version of *%s* on AWS Step "
+            "Functions which was deployed by the user "
+            "*%s*." % (flow_name, prev_user)
+        )
+        obj.echo(
+            "To delete this flow, you need to use the same production token that they used."
+        )
+        obj.echo(
+            "Please reach out to them to get the token. Once you "
+            "have it, call this command:"
+        )
+        obj.echo("    step-functions delete --authorize MY_TOKEN", fg="green")
+        obj.echo(
+            'See "Organizing Results" at docs.metaflow.org for more '
+            "information about production tokens."
+        )
+
+    validate_token(
+        obj.state_machine_name, obj.token_prefix, authorize, _token_instructions
+    )
+
+    obj.echo(
+        "Deleting AWS Step Functions state machine *{name}*...".format(
+            name=obj.state_machine_name
+        ),
+        bold=True,
+    )
+    schedule_deleted, sfn_deleted = StepFunctions.delete(obj.state_machine_name)
+
+    if schedule_deleted:
+        obj.echo(
+            "Deleting Amazon EventBridge rule *{name}* as well...".format(
+                name=obj.state_machine_name
+            ),
+            bold=True,
+        )
+    if sfn_deleted:
+        obj.echo(
+            "Deleting the AWS Step Functions state machine may take a while. "
+            "Deploying the flow again to AWS Step Functions while the delete is in-flight will fail."
+        )
+        obj.echo(
+            "In-flight executions will not be affected. "
+            "If necessary, terminate them manually."
+        )
+
+
+@step_functions.command(help="Terminate flow execution on Step Functions.")
+@click.option(
+    "--authorize",
+    default=None,
+    type=str,
+    help="Authorize the termination with a production token",
+)
+@click.argument("run-id", required=True, type=str)
+@click.pass_obj
+def terminate(obj, run_id, authorize=None):
+    def _token_instructions(flow_name, prev_user):
+        obj.echo(
+            "There is an existing version of *%s* on AWS Step Functions which was "
+            "deployed by the user *%s*." % (flow_name, prev_user)
+        )
+        obj.echo(
+            "To terminate this flow, you need to use the same production token that they used."
+        )
+        obj.echo(
+            "Please reach out to them to get the token. Once you have it, call "
+            "this command:"
+        )
+        obj.echo("    step-functions terminate --authorize MY_TOKEN RUN_ID", fg="green")
+        obj.echo(
+            'See "Organizing Results" at docs.metaflow.org for more information '
+            "about production tokens."
+        )
+
+    validate_run_id(
+        obj.state_machine_name, obj.token_prefix, authorize, run_id, _token_instructions
+    )
+
+    # Trim prefix from run_id
+    name = run_id[4:]
+    obj.echo(
+        "Terminating run *{run_id}* for {flow_name} ...".format(
+            run_id=run_id, flow_name=obj.flow.name
+        ),
+        bold=True,
+    )
+
+    terminated = StepFunctions.terminate(obj.state_machine_name, name)
+    if terminated:
+        obj.echo("\nRun terminated at %s." % terminated.get("stopDate"))
+
+
+def validate_run_id(
+    state_machine_name, token_prefix, authorize, run_id, instructions_fn=None
+):
+    if not run_id.startswith("sfn-"):
+        raise RunIdMismatch(
+            "Run IDs for flows executed through AWS Step Functions begin with 'sfn-'"
+        )
+
+    name = run_id[4:]
+    execution = StepFunctions.get_execution(state_machine_name, name)
+    if execution is None:
+        raise MetaflowException(
+            "Could not find the execution *%s* (in RUNNING state) for the state machine *%s* on AWS Step Functions"
+            % (name, state_machine_name)
+        )
+
+    _, owner, token, _ = execution
+
+    if authorize is None:
+        authorize = load_token(token_prefix)
+    elif authorize.startswith("production:"):
+        authorize = authorize[11:]
+
+    if owner != get_username() and authorize != token:
+        if instructions_fn:
+            instructions_fn(flow_name=name, prev_user=owner)
+        raise IncorrectProductionToken("Try again with the correct production token.")
+
+    return True
+
+
+def validate_token(name, token_prefix, authorize, instruction_fn=None):
+    """
+    Validate that the production token matches that of the deployed flow.
+
+    In case both the user and token do not match, raises an error.
+    Optionally outputs instructions on token usage via the provided instruction_fn(flow_name, prev_user)
+    """
+    # TODO: Unify this with the existing resolve_token implementation.
+
+    # 1) retrieve the previous deployment, if one exists
+    workflow = StepFunctions.get_existing_deployment(name)
+    if workflow is None:
+        prev_token = None
+    else:
+        prev_user, prev_token = workflow
+
+    # 2) authorize this deployment
+    if prev_token is not None:
+        if authorize is None:
+            authorize = load_token(token_prefix)
+        elif authorize.startswith("production:"):
+            authorize = authorize[11:]
+
+        # we allow the user who deployed the previous version to re-deploy,
+        # even if they don't have the token
+        # NOTE: The username is visible in multiple sources, and can be set by the user.
+        # Should we consider being stricter here?
+        if prev_user != get_username() and authorize != prev_token:
+            if instruction_fn:
+                instruction_fn(flow_name=name, prev_user=prev_user)
+            raise IncorrectProductionToken(
+                "Try again with the correct production token."
+            )
+
+    # 3) all validations passed, store the previous token for future use
+    token = prev_token
+
+    store_token(token_prefix, token)
+    return True

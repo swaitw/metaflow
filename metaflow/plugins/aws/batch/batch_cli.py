@@ -4,15 +4,13 @@ import sys
 import time
 import traceback
 
-from distutils.dir_util import copy_tree
-
 from metaflow import util
 from metaflow import R
 from metaflow.exception import CommandException, METAFLOW_EXIT_DISALLOW_RETRY
-from metaflow.metadata.util import sync_local_metadata_from_datastore
+from metaflow.metadata_provider.util import sync_local_metadata_from_datastore
 from metaflow.metaflow_config import DATASTORE_LOCAL_DIR
 from metaflow.mflog import TASK_LOG_SOURCE
-
+from metaflow.unbounded_foreach import UBF_CONTROL, UBF_TASK
 from .batch import Batch, BatchKilledException
 
 
@@ -140,9 +138,43 @@ def kill(ctx, run_id, user, my_runs):
 @click.option("--shared-memory", help="Shared Memory requirement for AWS Batch.")
 @click.option("--max-swap", help="Max Swap requirement for AWS Batch.")
 @click.option("--swappiness", help="Swappiness requirement for AWS Batch.")
-# TODO: Maybe remove it altogether since it's not used here
-@click.option("--ubf-context", default=None, type=click.Choice([None, "ubf_control"]))
+@click.option("--inferentia", help="Inferentia requirement for AWS Batch.")
+@click.option(
+    "--efa",
+    default=0,
+    type=int,
+    help="Activate designated number of elastic fabric adapter devices. "
+    "EFA driver must be installed and instance type compatible with EFA",
+)
+@click.option("--use-tmpfs", is_flag=True, help="tmpfs requirement for AWS Batch.")
+@click.option("--tmpfs-tempdir", is_flag=True, help="tmpfs requirement for AWS Batch.")
+@click.option("--tmpfs-size", help="tmpfs requirement for AWS Batch.")
+@click.option("--tmpfs-path", help="tmpfs requirement for AWS Batch.")
+# NOTE: ubf-context is not explicitly used, but @parallel decorator tries to pass this so keep it for now
+@click.option(
+    "--ubf-context", default=None, type=click.Choice(["none", UBF_CONTROL, UBF_TASK])
+)
 @click.option("--host-volumes", multiple=True)
+@click.option("--efs-volumes", multiple=True)
+@click.option(
+    "--ephemeral-storage",
+    default=None,
+    type=int,
+    help="Ephemeral storage (for AWS Batch only)",
+)
+@click.option(
+    "--log-driver",
+    default=None,
+    type=str,
+    help="Log driver for AWS ECS container",
+)
+@click.option(
+    "--log-options",
+    default=None,
+    type=str,
+    multiple=True,
+    help="Log options for the chosen log driver",
+)
 @click.option(
     "--num-parallel",
     default=0,
@@ -167,21 +199,30 @@ def step(
     shared_memory=None,
     max_swap=None,
     swappiness=None,
+    inferentia=None,
+    efa=None,
+    use_tmpfs=None,
+    tmpfs_tempdir=None,
+    tmpfs_size=None,
+    tmpfs_path=None,
     host_volumes=None,
+    efs_volumes=None,
+    ephemeral_storage=None,
+    log_driver=None,
+    log_options=None,
     num_parallel=None,
     **kwargs
 ):
-    def echo(msg, stream="stderr", batch_id=None):
+    def echo(msg, stream="stderr", batch_id=None, **kwargs):
         msg = util.to_unicode(msg)
         if batch_id:
             msg = "[%s] %s" % (batch_id, msg)
-        ctx.obj.echo_always(msg, err=(stream == sys.stderr))
+        ctx.obj.echo_always(msg, err=(stream == sys.stderr), **kwargs)
 
     if R.use_r():
         entrypoint = R.entrypoint()
     else:
-        if executable is None:
-            executable = ctx.obj.environment.executable(step_name)
+        executable = ctx.obj.environment.executable(step_name, executable)
         entrypoint = "%s -u %s" % (executable, os.path.basename(sys.argv[0]))
 
     top_args = " ".join(util.dict_to_cli_options(ctx.parent.parent.params))
@@ -201,7 +242,7 @@ def step(
     if num_parallel and num_parallel > 1:
         # For multinode, we need to add a placeholder that can be mutated by the caller
         step_args += " [multinode-args]"
-    step_cli = u"{entrypoint} {top_args} step {step} {step_args}".format(
+    step_cli = "{entrypoint} {top_args} step {step} {step_args}".format(
         entrypoint=entrypoint,
         top_args=top_args,
         step=step_name,
@@ -290,12 +331,22 @@ def step(
                 shared_memory=shared_memory,
                 max_swap=max_swap,
                 swappiness=swappiness,
+                inferentia=inferentia,
+                efa=efa,
                 env=env,
                 attrs=attrs,
                 host_volumes=host_volumes,
+                efs_volumes=efs_volumes,
+                use_tmpfs=use_tmpfs,
+                tmpfs_tempdir=tmpfs_tempdir,
+                tmpfs_size=tmpfs_size,
+                tmpfs_path=tmpfs_path,
+                ephemeral_storage=ephemeral_storage,
+                log_driver=log_driver,
+                log_options=log_options,
                 num_parallel=num_parallel,
             )
-    except Exception as e:
+    except Exception:
         traceback.print_exc()
         _sync_metadata()
         sys.exit(METAFLOW_EXIT_DISALLOW_RETRY)
