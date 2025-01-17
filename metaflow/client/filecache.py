@@ -6,7 +6,9 @@ import time
 from tempfile import NamedTemporaryFile
 from hashlib import sha1
 
-from metaflow.datastore import DATASTORES, FlowDataStore
+from urllib.parse import urlparse
+
+from metaflow.datastore import FlowDataStore
 from metaflow.datastore.content_addressed_store import BlobCache
 from metaflow.exception import MetaflowException
 from metaflow.metaflow_config import (
@@ -15,6 +17,8 @@ from metaflow.metaflow_config import (
     CLIENT_CACHE_MAX_FLOWDATASTORE_COUNT,
     CLIENT_CACHE_MAX_TASKDATASTORE_COUNT,
 )
+
+from metaflow.plugins import DATASTORES
 
 NEW_FILE_QUARANTINE = 10
 
@@ -81,7 +85,6 @@ class FileCache(object):
     def get_log_legacy(
         self, ds_type, location, logtype, attempt, flow_name, run_id, step_name, task_id
     ):
-
         ds_cls = self._get_datastore_storage_impl(ds_type)
         ds_root = ds_cls.path_join(*ds_cls.path_split(location)[:-5])
         cache_id = self._flow_ds_id(ds_type, ds_root, flow_name)
@@ -309,17 +312,29 @@ class FileCache(object):
 
     @staticmethod
     def _flow_ds_id(ds_type, ds_root, flow_name):
-        return ".".join([ds_type, ds_root, flow_name])
+        p = urlparse(ds_root)
+        sanitized_root = (p.netloc + p.path).replace("/", "_")
+        return ".".join([ds_type, sanitized_root, flow_name])
 
     @staticmethod
     def _task_ds_id(ds_type, ds_root, flow_name, run_id, step_name, task_id, attempt):
+        p = urlparse(ds_root)
+        sanitized_root = (p.netloc + p.path).replace("/", "_")
         return ".".join(
-            [ds_type, ds_root, flow_name, run_id, step_name, task_id, str(attempt)]
+            [
+                ds_type,
+                sanitized_root,
+                flow_name,
+                run_id,
+                step_name,
+                task_id,
+                str(attempt),
+            ]
         )
 
     def _garbage_collect(self):
         now = time.time()
-        while self._objects and self._total > self._max_size * 1024 ** 2:
+        while self._objects and self._total > self._max_size * 1024**2:
             if now - self._objects[0][0] < NEW_FILE_QUARANTINE:
                 break
             ctime, size, path = self._objects.pop(0)
@@ -344,10 +359,10 @@ class FileCache(object):
 
     @staticmethod
     def _get_datastore_storage_impl(ds_type):
-        storage_impl = DATASTORES.get(ds_type, None)
-        if storage_impl is None:
+        storage_impl = [d for d in DATASTORES if d.TYPE == ds_type]
+        if len(storage_impl) == 0:
             raise FileCacheException("Datastore %s was not found" % ds_type)
-        return storage_impl
+        return storage_impl[0]
 
     def _get_flow_datastore(self, ds_type, ds_root, flow_name):
         cache_id = self._flow_ds_id(ds_type, ds_root, flow_name)

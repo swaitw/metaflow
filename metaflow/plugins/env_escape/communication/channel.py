@@ -9,7 +9,7 @@ class Channel(object):
 
     You can send and receive JSON serializable object directly with this interface
 
-    For now, this class does not do much but we could imagine some sort compression or other
+    For now this class does not do much, but we could imagine some sort compression or other
     transformation being added here
     """
 
@@ -36,7 +36,7 @@ class Channel(object):
             sz_bytes = self._stream.read(self._fmt.size, timeout)
             msg_sz = self._fmt.unpack(sz_bytes)[0]
             obj_bytes = self._stream.read(msg_sz, timeout)
-            return json.loads(obj_bytes, encoding="utf-8")
+            return json.loads(obj_bytes)
         except EOFError as e:
             raise RuntimeError("Cannot receive object over streaming interface: %s" % e)
         except BaseException as e:

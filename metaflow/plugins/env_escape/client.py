@@ -1,10 +1,12 @@
 import fcntl
+import gc
 import os
 import importlib
 import itertools
 import select
 from subprocess import Popen, PIPE
 import sys
+import threading
 import time
 
 from . import data_transferer
@@ -32,19 +34,39 @@ from .communication.channel import Channel
 from .communication.socket_bytestream import SocketByteStream
 
 from .data_transferer import DataTransferer, ObjReference
-from .exception_transferer import load_exception
-from .override_decorators import LocalAttrOverride, LocalException, LocalOverride
+from .exception_transferer import ExceptionMetaClass, load_exception
+from .override_decorators import (
+    LocalAttrOverride,
+    LocalExceptionDeserializer,
+    LocalOverride,
+)
 from .stub import create_class
+from .utils import get_canonical_name
 
 BIND_TIMEOUT = 0.1
 BIND_RETRY = 0
 
 
 class Client(object):
-    def __init__(self, python_executable, pythonpath, max_pickle_version, config_dir):
+    def __init__(
+        self, modules, python_executable, pythonpath, max_pickle_version, config_dir
+    ):
+        # Wrap with ImportError so that if users are just using the escaped module
+        # as optional, the typical logic of catching ImportError works properly
+        try:
+            self.inner_init(
+                python_executable, pythonpath, max_pickle_version, config_dir
+            )
+        except Exception as e:
+            # Typically it's one override per config so we just use the first one.
+            raise ImportError("Error loading module: %s" % str(e), name=modules[0])
+
+    def inner_init(self, python_executable, pythonpath, max_pickle_version, config_dir):
         # Make sure to init these variables (used in __del__) early on in case we
         # have an exception
         self._poller = None
+        self._poller_lock = threading.Lock()
+        self._active_pid = os.getpid()
         self._server_process = None
         self._socket_path = None
 
@@ -55,11 +77,20 @@ class Client(object):
         # The client launches the server when created; we use
         # Unix sockets for now
         server_module = ".".join([__package__, "server"])
-        self._socket_path = "/tmp/%s_%d" % (server_config, os.getpid())
+        self._socket_path = "/tmp/%s_%d" % (server_config, self._active_pid)
         if os.path.exists(self._socket_path):
             raise RuntimeError("Existing socket: %s" % self._socket_path)
         env = os.environ.copy()
         env["PYTHONPATH"] = pythonpath
+        # When coming from a conda environment, LD_LIBRARY_PATH may be set to
+        # first include the Conda environment's library. When breaking out to
+        # the underlying python, we need to reset it to the original LD_LIBRARY_PATH
+        ld_lib_path = env.get("LD_LIBRARY_PATH")
+        orig_ld_lib_path = env.get("MF_ORIG_LD_LIBRARY_PATH")
+        if ld_lib_path is not None and orig_ld_lib_path is not None:
+            env["LD_LIBRARY_PATH"] = orig_ld_lib_path
+            if orig_ld_lib_path is not None:
+                del env["MF_ORIG_LD_LIBRARY_PATH"]
         self._server_process = Popen(
             [
                 python_executable,
@@ -83,12 +114,35 @@ class Client(object):
         # distinguish it from other modules named "overrides" (either a third party
         # lib -- there is one -- or just other escaped modules). We therefore load
         # a fuller path to distinguish them from one another.
+        # This is a bit tricky though:
+        #  - it requires all `configurations` directories to NOT have a __init__.py
+        #    so that configurations can be loaded through extensions too. If this is
+        #    not the case, we will have a `configurations` module that will be registered
+        #    and not be a proper namespace package
+        #  - we want to import a specific file so we:
+        #    - set a prefix that is specific enough to NOT include anything outside
+        #      of the configuration so we end the prefix with "env_escape" (we know
+        #      that is in the path of all configurations). We could technically go
+        #      up to metaflow or metaflow_extensions BUT this then causes issues with
+        #      the extension mechanism and _resolve_relative_path in plugins (because
+        #      there are files loaded from plugins that refer to something outside of
+        #      plugins and if we load plugins and NOT metaflow.plugins, this breaks).
+        #    - set the package root from this prefix to everything up to overrides
+        #    - load the overrides file
+        #
+        # This way, we are sure that we are:
+        #  - loading this specific overrides
+        #  - not adding extra stuff to the prefix that we don't care about
+        #  - able to support configurations in both metaflow and extensions at the
+        #    same time
         pkg_components = []
         prefix, last_basename = os.path.split(config_dir)
-        while last_basename not in ("metaflow", "metaflow_extensions"):
+        while True:
             pkg_components.append(last_basename)
-            prefix, last_basename = os.path.split(prefix)
-        pkg_components.append(last_basename)
+            possible_prefix, last_basename = os.path.split(prefix)
+            if last_basename == "env_escape":
+                break
+            prefix = possible_prefix
 
         try:
             sys.path.insert(0, prefix)
@@ -118,7 +172,7 @@ class Client(object):
                     % self._server_process.stderr.read(),
                 )
             time.sleep(1)
-        # Open up the channel and setup the datastransfer pipeline
+        # Open up the channel and set up the datatransferer pipeline
         self._channel = Channel(SocketByteStream.unixconnect(self._socket_path))
         self._datatransferer = DataTransferer(self)
 
@@ -129,10 +183,11 @@ class Client(object):
             fcntl.fcntl(f, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
         # Set up poller
-        self._poller = select.poll()
-        self._poller.register(self._server_process.stdout, select.POLLIN)
-        self._poller.register(self._server_process.stderr, select.POLLIN)
-        self._poller.register(self._channel, select.POLLIN | select.POLLHUP)
+        with self._poller_lock:
+            self._poller = select.poll()
+            self._poller.register(self._server_process.stdout, select.POLLIN)
+            self._poller.register(self._server_process.stderr, select.POLLIN)
+            self._poller.register(self._channel, select.POLLIN | select.POLLHUP)
 
         # Get all exports that we are proxying
         response = self._communicate(
@@ -142,28 +197,41 @@ class Client(object):
         self._proxied_classes = {
             k: None
             for k in itertools.chain(
-                response[FIELD_CONTENT]["classes"], response[FIELD_CONTENT]["proxied"]
+                response[FIELD_CONTENT]["classes"],
+                response[FIELD_CONTENT]["proxied"],
+                (e[0] for e in response[FIELD_CONTENT]["exceptions"]),
             )
         }
+
+        self._exception_hierarchy = dict(response[FIELD_CONTENT]["exceptions"])
+        self._proxied_classnames = set(response[FIELD_CONTENT]["classes"]).union(
+            response[FIELD_CONTENT]["proxied"]
+        )
+        self._aliases = response[FIELD_CONTENT]["aliases"]
 
         # Determine all overrides
         self._overrides = {}
         self._getattr_overrides = {}
         self._setattr_overrides = {}
-        self._exception_overrides = {}
+        self._exception_deserializers = {}
         for override in override_values:
             if isinstance(override, (LocalOverride, LocalAttrOverride)):
                 for obj_name, obj_funcs in override.obj_mapping.items():
-                    if obj_name not in self._proxied_classes:
+                    canonical_name = get_canonical_name(obj_name, self._aliases)
+                    if canonical_name not in self._proxied_classes:
                         raise ValueError(
                             "%s does not refer to a proxied or override type" % obj_name
                         )
                     if isinstance(override, LocalOverride):
-                        override_dict = self._overrides.setdefault(obj_name, {})
+                        override_dict = self._overrides.setdefault(canonical_name, {})
                     elif override.is_setattr:
-                        override_dict = self._setattr_overrides.setdefault(obj_name, {})
+                        override_dict = self._setattr_overrides.setdefault(
+                            canonical_name, {}
+                        )
                     else:
-                        override_dict = self._getattr_overrides.setdefault(obj_name, {})
+                        override_dict = self._getattr_overrides.setdefault(
+                            canonical_name, {}
+                        )
                     if isinstance(obj_funcs, str):
                         obj_funcs = (obj_funcs,)
                     for name in obj_funcs:
@@ -172,11 +240,18 @@ class Client(object):
                                 "%s was already overridden for %s" % (name, obj_name)
                             )
                         override_dict[name] = override.func
-            if isinstance(override, LocalException):
-                cur_ex = self._exception_overrides.get(override.class_path, None)
-                if cur_ex is not None:
-                    raise ValueError("Exception %s redefined" % override.class_path)
-                self._exception_overrides[override.class_path] = override.wrapped_class
+            if isinstance(override, LocalExceptionDeserializer):
+                canonical_name = get_canonical_name(override.class_path, self._aliases)
+                if canonical_name not in self._exception_hierarchy:
+                    raise ValueError(
+                        "%s does not refer to an exception type" % override.class_path
+                    )
+                cur_des = self._exception_deserializers.get(canonical_name, None)
+                if cur_des is not None:
+                    raise ValueError(
+                        "Exception %s has multiple deserializers" % override.class_path
+                    )
+                self._exception_deserializers[canonical_name] = override.deserializer
 
         # Proxied standalone functions are functions that are proxied
         # as part of other objects like defaultdict for which we create a
@@ -192,8 +267,6 @@ class Client(object):
             "aliases": response[FIELD_CONTENT]["aliases"],
         }
 
-        self._aliases = response[FIELD_CONTENT]["aliases"]
-
     def __del__(self):
         self.cleanup()
 
@@ -201,10 +274,11 @@ class Client(object):
         # Clean up the server; we drain all messages if any
         if self._poller is not None:
             # If we have self._poller, we have self._server_process
-            self._poller.unregister(self._channel)
-            last_evts = self._poller.poll(5)
+            with self._poller_lock:
+                self._poller.unregister(self._channel)
+                last_evts = self._poller.poll(5)
             for fd, _ in last_evts:
-                # Readlines will never block here because bufsize is set to
+                # Readlines will never block here because `bufsize` is set to
                 # 1 (line buffering)
                 if fd == self._server_process.stdout.fileno():
                     sys.stdout.write(self._server_process.stdout.readline())
@@ -236,8 +310,9 @@ class Client(object):
     def get_exports(self):
         return self._export_info
 
-    def get_local_exception_overrides(self):
-        return self._exception_overrides
+    def get_exception_deserializer(self, name):
+        cannonical_name = get_canonical_name(name, self._aliases)
+        return self._exception_deserializers.get(cannonical_name)
 
     def stub_request(self, stub, request_type, *args, **kwargs):
         # Encode the operation to send over the wire and wait for the response
@@ -261,7 +336,7 @@ class Client(object):
         if response_type == MSG_REPLY:
             return self.decode(response[FIELD_CONTENT])
         elif response_type == MSG_EXCEPTION:
-            raise load_exception(self._datatransferer, response[FIELD_CONTENT])
+            raise load_exception(self, response[FIELD_CONTENT])
         elif response_type == MSG_INTERNAL_ERROR:
             raise RuntimeError(
                 "Error in the server runtime:\n\n===== SERVER TRACEBACK =====\n%s"
@@ -282,10 +357,27 @@ class Client(object):
         # this connection will be converted to a local stub.
         return self._datatransferer.load(json_obj)
 
-    def get_local_class(self, name, obj_id=None):
+    def get_local_class(
+        self, name, obj_id=None, is_returned_exception=False, is_parent=False
+    ):
         # Gets (and creates if needed), the class mapping to the remote
         # class of name 'name'.
-        name = self._get_canonical_name(name)
+
+        # We actually deal with four types of classes:
+        # - proxied functions
+        # - classes that are proxied regular classes AND proxied exceptions
+        # - classes that are proxied regular classes AND NOT proxied exceptions
+        # - classes that are NOT proxied regular classes AND are proxied exceptions
+        name = get_canonical_name(name, self._aliases)
+
+        def name_to_parent_name(name):
+            return "parent:%s" % name
+
+        if is_parent:
+            lookup_name = name_to_parent_name(name)
+        else:
+            lookup_name = name
+
         if name == "function":
             # Special handling of pickled functions. We create a new class that
             # simply has a __call__ method that will forward things back to
@@ -294,17 +386,87 @@ class Client(object):
                 raise RuntimeError("Local function unpickling without an object ID")
             if obj_id not in self._proxied_standalone_functions:
                 self._proxied_standalone_functions[obj_id] = create_class(
-                    self, "__function_%s" % obj_id, {}, {}, {}, {"__call__": ""}
+                    self,
+                    "__main__.__function_%s" % obj_id,
+                    {},
+                    {},
+                    {},
+                    {"__call__": ""},
+                    [],
                 )
             return self._proxied_standalone_functions[obj_id]
+        local_class = self._proxied_classes.get(lookup_name, None)
+        if local_class is not None:
+            return local_class
 
-        if name not in self._proxied_classes:
+        is_proxied_exception = name in self._exception_hierarchy
+        is_proxied_non_exception = name in self._proxied_classnames
+
+        if not is_proxied_exception and not is_proxied_non_exception:
+            if is_returned_exception or is_parent:
+                # In this case, it may be a local exception that we need to
+                # recreate
+                try:
+                    ex_module, ex_name = name.rsplit(".", 1)
+                    __import__(ex_module, None, None, "*")
+                except Exception:
+                    pass
+                if ex_module in sys.modules and issubclass(
+                    getattr(sys.modules[ex_module], ex_name), BaseException
+                ):
+                    # This is a local exception that we can recreate
+                    local_exception = getattr(sys.modules[ex_module], ex_name)
+                    wrapped_exception = ExceptionMetaClass(
+                        ex_name,
+                        (local_exception,),
+                        dict(getattr(local_exception, "__dict__", {})),
+                    )
+                    wrapped_exception.__module__ = ex_module
+                    self._proxied_classes[lookup_name] = wrapped_exception
+                    return wrapped_exception
+
             raise ValueError("Class '%s' is not known" % name)
-        local_class = self._proxied_classes[name]
-        if local_class is None:
-            # We need to build up this class. To do so, we take everything that the
-            # remote class has and remove UNSUPPORTED things and overridden things
+
+        # At this stage:
+        # - we don't have a local_class for this
+        # - it is not an inbuilt exception so it is either a proxied exception, a
+        #   proxied class or a proxied object that is both an exception and a class.
+
+        parents = []
+        if is_proxied_exception:
+            # If exception, we need to get the parents from the exception
+            ex_parents = self._exception_hierarchy[name]
+            for parent in ex_parents:
+                # We always consider it to be an exception so that we wrap even non
+                # proxied builtins exceptions
+                parents.append(self.get_local_class(parent, is_parent=True))
+        # For regular classes, we get what it exposes from the server
+        if is_proxied_non_exception:
             remote_methods = self.stub_request(None, OP_GETMETHODS, name)
+        else:
+            remote_methods = {}
+
+        parent_local_class = None
+        local_class = None
+        if is_proxied_exception:
+            # If we are a proxied exception AND a proxied class, we create two classes:
+            # actually:
+            #  - the class itself (which is a stub)
+            #  - the class in the capacity of a parent class (to another exception
+            #    presumably). The reason for this is that if we have an exception/proxied
+            #    class A and another B and B inherits from A, the MRO order would be all
+            #    wrong since both A and B would also inherit from `Stub`. Here what we
+            #    do is:
+            #      - A_parent inherits from the actual parents of A (let's assume a
+            #        builtin exception)
+            #      - A inherits from (Stub, A_parent)
+            #      - B_parent inherits from A_parent and the builtin Exception
+            #      - B inherits from (Stub, B_parent)
+            ex_module, ex_name = name.rsplit(".", 1)
+            parent_local_class = ExceptionMetaClass(ex_name, (*parents,), {})
+            parent_local_class.__module__ = ex_module
+
+        if is_proxied_non_exception:
             local_class = create_class(
                 self,
                 name,
@@ -312,9 +474,26 @@ class Client(object):
                 self._getattr_overrides.get(name, {}),
                 self._setattr_overrides.get(name, {}),
                 remote_methods,
+                (parent_local_class,) if parent_local_class else None,
             )
+        if parent_local_class:
+            self._proxied_classes[name_to_parent_name(name)] = parent_local_class
+        if local_class:
             self._proxied_classes[name] = local_class
-        return local_class
+        else:
+            # This is for the case of pure proxied exceptions -- we want the lookup of
+            # foo.MyException to be the same class as looking of foo.MyException as a parent
+            # of another exception so `isinstance` works properly
+            self._proxied_classes[name] = parent_local_class
+
+        if is_parent:
+            # This should never happen but making sure
+            if not parent_local_class:
+                raise RuntimeError(
+                    "Exception parent class %s is not a proxied exception" % name
+                )
+            return parent_local_class
+        return self._proxied_classes[name]
 
     def can_pickle(self, obj):
         return getattr(obj, "___connection___", None) == self
@@ -343,22 +522,25 @@ class Client(object):
         obj_id = obj.identifier
         local_instance = self._proxied_objects.get(obj_id)
         if not local_instance:
-            local_class = self.get_local_class(remote_class_name, obj_id)
+            local_class = self.get_local_class(remote_class_name, obj_id=obj_id)
             local_instance = local_class(self, remote_class_name, obj_id)
         return local_instance
 
-    def _get_canonical_name(self, name):
-        # We look at the aliases looking for the most specific match first
-        base_name = self._aliases.get(name)
-        if base_name is not None:
-            return base_name
-        for idx in reversed([pos for pos, char in enumerate(name) if char == "."]):
-            base_name = self._aliases.get(name[:idx])
-            if base_name is not None:
-                return ".".join([base_name, name[idx + 1 :]])
-        return name
-
     def _communicate(self, msg):
+        if os.getpid() != self._active_pid:
+            raise RuntimeError(
+                "You cannot use the environment escape across process boundaries."
+            )
+        # We also disable the GC because in some rare cases, it may try to delete
+        # a remote object while we are communicating which will cause a deadlock
+        try:
+            gc.disable()
+            with self._poller_lock:
+                return self._locked_communicate(msg)
+        finally:
+            gc.enable()
+
+    def _locked_communicate(self, msg):
         self._channel.send(msg)
         response_ready = False
         while not response_ready:
@@ -366,17 +548,17 @@ class Client(object):
             for fd, _ in evt_list:
                 if fd == self._channel.fileno():
                     # We deal with this last as this basically gives us the
-                    # response so we stop looking at things on stdout/stderr
+                    # response, so we stop looking at things on stdout/stderr
                     response_ready = True
-                # Readlines will never block here because bufsize is set to 1
+                # Readlines will never block here because `bufsize` is set to 1
                 # (line buffering)
                 elif fd == self._server_process.stdout.fileno():
                     sys.stdout.write(self._server_process.stdout.readline())
                 elif fd == self._server_process.stderr.fileno():
                     sys.stderr.write(self._server_process.stderr.readline())
-        # We make sure there is nothing left to read. On the server side, a
-        # flush happens before we respond so we read until we get an exception;
-        # this is non blocking
+        # We make sure there is nothing left to read. On the server side a
+        # flush happens before we respond, so we read until we get an exception;
+        # this is non-blocking
         while True:
             try:
                 line = self._server_process.stdout.readline()

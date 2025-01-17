@@ -50,20 +50,6 @@ except NameError:
 
     from shlex import quote as _quote
 
-if sys.version_info >= (3, 7):
-    from collections import namedtuple
-
-    namedtuple_with_defaults = namedtuple
-else:
-    from collections import namedtuple
-
-    def namedtuple_with_defaults(typename, field_names, defaults=()):
-        T = namedtuple(typename, field_names)
-        T.__new__.__defaults__ = (None,) * len(T._fields)
-        prototype = T(*defaults)
-        T.__new__.__defaults__ = tuple(prototype)
-        return T
-
 
 class TempDir(object):
     # Provide a temporary directory since Python 2.7 does not have it inbuilt
@@ -165,10 +151,11 @@ def get_username():
     Return the name of the current user, or None if the current user
     could not be determined.
     """
+    from metaflow.metaflow_config import USER
+
     # note: the order of the list matters
-    ENVVARS = ["METAFLOW_USER", "SUDO_USER", "USERNAME", "USER"]
-    for var in ENVVARS:
-        user = os.environ.get(var)
+    ENVVARS = ["SUDO_USER", "USERNAME", "USER"]
+    for user in [USER] + [os.environ.get(x) for x in ENVVARS]:
         if user and user != "root":
             return user
     return None
@@ -191,7 +178,7 @@ def resolve_identity():
 
 
 def get_latest_run_id(echo, flow_name):
-    from metaflow.datastore.local_storage import LocalStorage
+    from metaflow.plugins.datastores.local_storage import LocalStorage
 
     local_root = LocalStorage.datastore_root
     if local_root is None:
@@ -207,7 +194,7 @@ def get_latest_run_id(echo, flow_name):
 
 
 def write_latest_run_id(obj, run_id):
-    from metaflow.datastore.local_storage import LocalStorage
+    from metaflow.plugins.datastores.local_storage import LocalStorage
 
     if LocalStorage.datastore_root is None:
         LocalStorage.datastore_root = LocalStorage.get_datastore_root_from_config(
@@ -249,7 +236,6 @@ def get_object_package_version(obj):
 
 
 def compress_list(lst, separator=",", rangedelim=":", zlibmarker="!", zlibmin=500):
-
     bad_items = [x for x in lst if separator in x or rangedelim in x or zlibmarker in x]
     if bad_items:
         raise MetaflowInternalError(
@@ -310,6 +296,9 @@ def get_metaflow_root():
 
 
 def dict_to_cli_options(params):
+    # Prevent circular imports
+    from .user_configs.config_options import ConfigInput
+
     for k, v in params.items():
         # Omit boolean options set to false or None, but preserve options with an empty
         # string argument.
@@ -318,6 +307,20 @@ def dict_to_cli_options(params):
             # keyword in Python, so we call it 'decospecs' in click args
             if k == "decospecs":
                 k = "with"
+            if k in ("config_file", "config_value"):
+                # Special handling here since we gather them all in one option but actually
+                # need to send them one at a time using --config-value <name> kv.<name>
+                # Note it can be either config_file or config_value depending
+                # on click processing order.
+                for config_name in v.keys():
+                    yield "--config-value"
+                    yield to_unicode(config_name)
+                    yield to_unicode(ConfigInput.make_key_name(config_name))
+                continue
+            if k == "local_config_file":
+                # Skip this value -- it should only be used locally and never when
+                # forming another command line
+                continue
             k = k.replace("_", "-")
             v = v if isinstance(v, (list, tuple, set)) else [v]
             for value in v:
@@ -396,9 +399,9 @@ def to_camelcase(obj):
     if isinstance(obj, dict):
         res = obj.__class__()
         for k in obj:
-            res[
-                re.sub(r"(?!^)_([a-zA-Z])", lambda x: x.group(1).upper(), k)
-            ] = to_camelcase(obj[k])
+            res[re.sub(r"(?!^)_([a-zA-Z])", lambda x: x.group(1).upper(), k)] = (
+                to_camelcase(obj[k])
+            )
     elif isinstance(obj, (list, set, tuple)):
         res = obj.__class__(to_camelcase(v) for v in obj)
     else:
@@ -415,11 +418,56 @@ def to_pascalcase(obj):
     if isinstance(obj, dict):
         res = obj.__class__()
         for k in obj:
-            res[
-                re.sub("([a-zA-Z])", lambda x: x.groups()[0].upper(), k, 1)
-            ] = to_pascalcase(obj[k])
+            res[re.sub("([a-zA-Z])", lambda x: x.groups()[0].upper(), k, 1)] = (
+                to_pascalcase(obj[k])
+            )
     elif isinstance(obj, (list, set, tuple)):
         res = obj.__class__(to_pascalcase(v) for v in obj)
     else:
         return obj
     return res
+
+
+def tar_safe_extract(tar, path=".", members=None, *, numeric_owner=False):
+    def is_within_directory(abs_directory, target):
+        prefix = os.path.commonprefix([abs_directory, os.path.abspath(target)])
+        return prefix == abs_directory
+
+    abs_directory = os.path.abspath(path)
+    if any(
+        not is_within_directory(abs_directory, os.path.join(path, member.name))
+        for member in tar.getmembers()
+    ):
+        raise Exception("Attempted path traversal in TAR file")
+
+    tar.extractall(path, members, numeric_owner=numeric_owner)
+
+
+def to_pod(value):
+    """
+    Convert a python object to plain-old-data (POD) format.
+
+    Parameters
+    ----------
+    value : Any
+        Value to convert to POD format. The value can be a string, number, list,
+        dictionary, or a nested structure of these types.
+    """
+    # Prevent circular imports
+    from metaflow.parameters import DeployTimeField
+
+    if isinstance(value, (str, int, float)):
+        return value
+    if isinstance(value, dict):
+        return {to_pod(k): to_pod(v) for k, v in value.items()}
+    if isinstance(value, (list, set, tuple)):
+        return [to_pod(v) for v in value]
+    if isinstance(value, DeployTimeField):
+        return value.print_representation
+    return str(value)
+
+
+if sys.version_info[:2] > (3, 5):
+    from metaflow._vendor.packaging.version import parse as version_parse
+else:
+    from distutils.version import LooseVersion as version_parse

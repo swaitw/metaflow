@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
-from collections import defaultdict, deque
+from collections import defaultdict
 import copy
 import random
-import select
-import sys
 import time
 import hashlib
 
@@ -89,6 +87,9 @@ class BatchJob(object):
         # Multinode
         if getattr(self, "num_parallel", 0) >= 1:
             num_nodes = self.num_parallel
+            # We need this task-id set so that all the nodes are aware of the control
+            # task's task-id. These "MF_" variables populate the `current.parallel` namedtuple
+            self.environment_variable("MF_PARALLEL_CONTROL_TASK_ID", self._task_id)
             main_task_override = copy.deepcopy(self.payload["containerOverrides"])
 
             # main
@@ -148,8 +149,19 @@ class BatchJob(object):
         shared_memory,
         max_swap,
         swappiness,
+        inferentia,
+        efa,
+        memory,
         host_volumes,
+        efs_volumes,
+        use_tmpfs,
+        tmpfs_tempdir,
+        tmpfs_size,
+        tmpfs_path,
         num_parallel,
+        ephemeral_storage,
+        log_driver,
+        log_options,
     ):
         # identify platform from any compute environment associated with the
         # queue
@@ -187,6 +199,25 @@ class BatchJob(object):
             "propagateTags": True,
         }
 
+        log_options_dict = {}
+        if log_options:
+            if isinstance(log_options, str):
+                log_options = [log_options]
+            for each_log_option in log_options:
+                k, v = each_log_option.split(":", 1)
+                log_options_dict[k] = v
+
+        if log_driver or log_options:
+            job_definition["containerProperties"]["logConfiguration"] = {}
+        if log_driver:
+            job_definition["containerProperties"]["logConfiguration"][
+                "logDriver"
+            ] = log_driver
+        if log_options:
+            job_definition["containerProperties"]["logConfiguration"][
+                "options"
+            ] = log_options_dict
+
         if platform == "FARGATE" or platform == "FARGATE_SPOT":
             if num_parallel > 1:
                 raise BatchJobException("Fargate does not support multinode jobs.")
@@ -202,6 +233,10 @@ class BatchJob(object):
             job_definition["containerProperties"]["networkConfiguration"] = {
                 "assignPublicIp": "ENABLED"
             }
+            if ephemeral_storage:
+                job_definition["containerProperties"]["ephemeralStorage"] = {
+                    "sizeInGiB": ephemeral_storage
+                }
 
         if platform == "EC2" or platform == "SPOT":
             if "linuxParameters" not in job_definition["containerProperties"]:
@@ -209,7 +244,7 @@ class BatchJob(object):
             if shared_memory is not None:
                 if not (
                     isinstance(shared_memory, (int, unicode, basestring))
-                    and int(shared_memory) > 0
+                    and int(float(shared_memory)) > 0
                 ):
                     raise BatchJobException(
                         "Invalid shared memory size value ({}); "
@@ -218,7 +253,7 @@ class BatchJob(object):
                 else:
                     job_definition["containerProperties"]["linuxParameters"][
                         "sharedMemorySize"
-                    ] = int(shared_memory)
+                    ] = int(float(shared_memory))
             if swappiness is not None:
                 if not (
                     isinstance(swappiness, (int, unicode, basestring))
@@ -246,20 +281,130 @@ class BatchJob(object):
                     job_definition["containerProperties"]["linuxParameters"][
                         "maxSwap"
                     ] = int(max_swap)
+            if ephemeral_storage:
+                raise BatchJobException(
+                    "The ephemeral_storage parameter is only available for FARGATE compute environments"
+                )
 
-        if host_volumes:
+        if inferentia:
+            if not (isinstance(inferentia, (int, unicode, basestring))):
+                raise BatchJobException(
+                    "Invalid inferentia value: ({}) (should be 0 or greater)".format(
+                        inferentia
+                    )
+                )
+            else:
+                job_definition["containerProperties"]["linuxParameters"]["devices"] = []
+                for i in range(int(inferentia)):
+                    job_definition["containerProperties"]["linuxParameters"][
+                        "devices"
+                    ].append(
+                        {
+                            "containerPath": "/dev/neuron{}".format(i),
+                            "hostPath": "/dev/neuron{}".format(i),
+                            "permissions": ["READ", "WRITE"],
+                        }
+                    )
+
+        if host_volumes or efs_volumes:
             job_definition["containerProperties"]["volumes"] = []
             job_definition["containerProperties"]["mountPoints"] = []
-            if isinstance(host_volumes, str):
-                host_volumes = [host_volumes]
-            for host_path in host_volumes:
-                name = host_path.replace("/", "_").replace(".", "_")
-                job_definition["containerProperties"]["volumes"].append(
-                    {"name": name, "host": {"sourcePath": host_path}}
+
+            if host_volumes:
+                if isinstance(host_volumes, str):
+                    host_volumes = [host_volumes]
+                for host_path in host_volumes:
+                    container_path = host_path
+                    if ":" in host_path:
+                        host_path, container_path = host_path.split(":", 1)
+                    name = host_path.replace("/", "_").replace(".", "_")
+                    job_definition["containerProperties"]["volumes"].append(
+                        {"name": name, "host": {"sourcePath": host_path}}
+                    )
+                    job_definition["containerProperties"]["mountPoints"].append(
+                        {"sourceVolume": name, "containerPath": container_path}
+                    )
+
+            if efs_volumes:
+                if isinstance(efs_volumes, str):
+                    efs_volumes = [efs_volumes]
+                for efs_id in efs_volumes:
+                    container_path = "/mnt/" + efs_id
+                    if ":" in efs_id:
+                        efs_id, container_path = efs_id.split(":", 1)
+                    name = "efs_" + efs_id
+                    job_definition["containerProperties"]["volumes"].append(
+                        {
+                            "name": name,
+                            "efsVolumeConfiguration": {
+                                "fileSystemId": efs_id,
+                                "transitEncryption": "ENABLED",
+                            },
+                        }
+                    )
+                    job_definition["containerProperties"]["mountPoints"].append(
+                        {"sourceVolume": name, "containerPath": container_path}
+                    )
+
+        if use_tmpfs and (platform == "FARGATE" or platform == "FARGATE_SPOT"):
+            raise BatchJobException(
+                "tmpfs is not available for Fargate compute resources"
+            )
+        if use_tmpfs or (tmpfs_size and not use_tmpfs):
+            if tmpfs_size:
+                if not (isinstance(tmpfs_size, (int, unicode, basestring))):
+                    raise BatchJobException(
+                        "Invalid tmpfs value: ({}) (should be 0 or greater)".format(
+                            tmpfs_size
+                        )
+                    )
+            else:
+                # default tmpfs behavior - https://man7.org/linux/man-pages/man5/tmpfs.5.html
+                tmpfs_size = int(float(memory)) / 2
+
+            job_definition["containerProperties"]["linuxParameters"]["tmpfs"] = [
+                {
+                    "containerPath": tmpfs_path,
+                    "size": int(tmpfs_size),
+                    "mountOptions": [
+                        # should map to rw, suid, dev, exec, auto, nouser, and async
+                        "defaults"
+                    ],
+                }
+            ]
+
+        if efa:
+            if not (isinstance(efa, (int, unicode, basestring))):
+                raise BatchJobException(
+                    "Invalid efa value: ({}) (should be 0 or greater)".format(efa)
                 )
-                job_definition["containerProperties"]["mountPoints"].append(
-                    {"sourceVolume": name, "containerPath": host_path}
-                )
+            else:
+                if "linuxParameters" not in job_definition["containerProperties"]:
+                    job_definition["containerProperties"]["linuxParameters"] = {}
+                if (
+                    "devices"
+                    not in job_definition["containerProperties"]["linuxParameters"]
+                ):
+                    job_definition["containerProperties"]["linuxParameters"][
+                        "devices"
+                    ] = []
+                if (num_parallel or 0) > 1:
+                    # Multi-node parallel jobs require the container path and permissions explicitly specified in Job definition
+                    for i in range(int(efa)):
+                        job_definition["containerProperties"]["linuxParameters"][
+                            "devices"
+                        ].append(
+                            {
+                                "hostPath": "/dev/infiniband/uverbs{}".format(i),
+                                "containerPath": "/dev/infiniband/uverbs{}".format(i),
+                                "permissions": ["READ", "WRITE", "MKNOD"],
+                            }
+                        )
+                else:
+                    # Single-node container jobs only require host path in job definition
+                    job_definition["containerProperties"]["linuxParameters"][
+                        "devices"
+                    ].append({"hostPath": "/dev/infiniband/uverbs0"})
 
         self.num_parallel = num_parallel or 0
         if self.num_parallel >= 1:
@@ -283,6 +428,7 @@ class BatchJob(object):
                         "container": job_definition["containerProperties"],
                     }
                 )
+
             del job_definition["containerProperties"]  # not used for multi-node
 
         # check if job definition already exists
@@ -321,8 +467,19 @@ class BatchJob(object):
         shared_memory,
         max_swap,
         swappiness,
+        inferentia,
+        efa,
+        memory,
         host_volumes,
+        efs_volumes,
+        use_tmpfs,
+        tmpfs_tempdir,
+        tmpfs_size,
+        tmpfs_path,
         num_parallel,
+        ephemeral_storage,
+        log_driver,
+        log_options,
     ):
         self.payload["jobDefinition"] = self._register_job_definition(
             image,
@@ -332,8 +489,19 @@ class BatchJob(object):
             shared_memory,
             max_swap,
             swappiness,
+            inferentia,
+            efa,
+            memory,
             host_volumes,
+            efs_volumes,
+            use_tmpfs,
+            tmpfs_tempdir,
+            tmpfs_size,
+            tmpfs_path,
             num_parallel,
+            ephemeral_storage,
+            log_driver,
+            log_options,
         )
         return self
 
@@ -371,6 +539,14 @@ class BatchJob(object):
 
     def swappiness(self, swappiness):
         self._swappiness = swappiness
+        return self
+
+    def inferentia(self, inferentia):
+        self._inferentia = inferentia
+        return self
+
+    def efa(self, efa):
+        self._efa = efa
         return self
 
     def command(self, command):
@@ -495,7 +671,6 @@ class TriableException(Exception):
 
 
 class RunningJob(object):
-
     NUM_RETRIES = 8
 
     def __init__(self, id, client):
@@ -523,7 +698,7 @@ class RunningJob(object):
         # batch.submit_job API call is not strongly consistent(¯\_(ツ)_/¯).
         # We add a check here to guard against that. The `update()` call
         # will ensure that we poll `batch.describe_jobs` until we get a
-        # satisfactory response at least once through out the lifecycle of
+        # satisfactory response at least once throughout the lifecycle of
         # the job.
         if len(data["jobs"]) == 1:
             self._apply(data["jobs"][0])

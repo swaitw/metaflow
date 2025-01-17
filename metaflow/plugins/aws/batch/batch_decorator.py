@@ -1,30 +1,30 @@
 import os
-import sys
 import platform
-import requests
+import sys
 import time
 
-from metaflow import util
 from metaflow import R, current
-
 from metaflow.decorators import StepDecorator
-from metaflow.plugins import ResourcesDecorator
-from metaflow.plugins.timeout_decorator import get_run_time_limit_for_task
-from metaflow.metadata import MetaDatum
-from metaflow.metadata.util import sync_local_metadata_to_datastore
+from metaflow.metadata_provider import MetaDatum
+from metaflow.metadata_provider.util import sync_local_metadata_to_datastore
 from metaflow.metaflow_config import (
-    ECS_S3_ACCESS_IAM_ROLE,
-    BATCH_JOB_QUEUE,
     BATCH_CONTAINER_IMAGE,
     BATCH_CONTAINER_REGISTRY,
-    ECS_FARGATE_EXECUTION_ROLE,
+    BATCH_JOB_QUEUE,
     DATASTORE_LOCAL_DIR,
+    ECS_FARGATE_EXECUTION_ROLE,
+    ECS_S3_ACCESS_IAM_ROLE,
 )
+from metaflow.plugins.timeout_decorator import get_run_time_limit_for_task
 from metaflow.sidecar import Sidecar
 from metaflow.unbounded_foreach import UBF_CONTROL
 
+from ..aws_utils import (
+    compute_resource_attributes,
+    get_docker_registry,
+    get_ec2_instance_metadata,
+)
 from .batch import BatchException
-from ..aws_utils import compute_resource_attributes, get_docker_registry
 
 
 class BatchDecorator(StepDecorator):
@@ -33,43 +33,66 @@ class BatchDecorator(StepDecorator):
 
     Parameters
     ----------
-    cpu : int
-        Number of CPUs required for this step. Defaults to 1. If `@resources` is
+    cpu : int, default 1
+        Number of CPUs required for this step. If `@resources` is
         also present, the maximum value from all decorators is used.
-    gpu : int
-        Number of GPUs required for this step. Defaults to 0. If `@resources` is
+    gpu : int, default 0
+        Number of GPUs required for this step. If `@resources` is
         also present, the maximum value from all decorators is used.
-    memory : int
-        Memory size (in MB) required for this step. Defaults to 4096 (4GB). If
+    memory : int, default 4096
+        Memory size (in MB) required for this step. If
         `@resources` is also present, the maximum value from all decorators is
         used.
-    image : string
-        Docker image to use when launching on AWS Batch. If not specified, a
-        default Docker image mapping to the current version of Python is used.
-    queue : string
-        AWS Batch Job Queue to submit the job to. Defaults to the one
-        specified by the configuration variable `METAFLOW_BATCH_JOB_QUEUE`.
-    iam_role : string
+    image : str, optional, default None
+        Docker image to use when launching on AWS Batch. If not specified, and
+        METAFLOW_BATCH_CONTAINER_IMAGE is specified, that image is used. If
+        not, a default Docker image mapping to the current version of Python is used.
+    queue : str, default METAFLOW_BATCH_JOB_QUEUE
+        AWS Batch Job Queue to submit the job to.
+    iam_role : str, default METAFLOW_ECS_S3_ACCESS_IAM_ROLE
         AWS IAM role that AWS Batch container uses to access AWS cloud resources.
-        Defaults to the one specified by the configuration variable `METAFLOW_ECS_S3_ACCESS_IAM_ROLE`.
-    execution_role : string
+    execution_role : str, default METAFLOW_ECS_FARGATE_EXECUTION_ROLE
         AWS IAM role that AWS Batch can use [to trigger AWS Fargate tasks]
         (https://docs.aws.amazon.com/batch/latest/userguide/execution-IAM-role.html).
-        Defaults to the one determined by the configuration variable
-        `METAFLOW_ECS_FARGATE_EXECUTION_ROLE`.
-    shared_memory : int
+    shared_memory : int, optional, default None
         The value for the size (in MiB) of the /dev/shm volume for this step.
         This parameter maps to the `--shm-size` option in Docker.
-    max_swap : int
+    max_swap : int, optional, default None
         The total amount of swap memory (in MiB) a container can use for this
         step. This parameter is translated to the `--memory-swap` option in
         Docker where the value is the sum of the container memory plus the
         `max_swap` value.
-    swappiness : int
+    swappiness : int, optional, default None
         This allows you to tune memory swappiness behavior for this step.
         A swappiness value of 0 causes swapping not to happen unless absolutely
         necessary. A swappiness value of 100 causes pages to be swapped very
         aggressively. Accepted values are whole numbers between 0 and 100.
+    use_tmpfs : bool, default False
+        This enables an explicit tmpfs mount for this step. Note that tmpfs is
+        not available on Fargate compute environments
+    tmpfs_tempdir : bool, default True
+        sets METAFLOW_TEMPDIR to tmpfs_path if set for this step.
+    tmpfs_size : int, optional, default None
+        The value for the size (in MiB) of the tmpfs mount for this step.
+        This parameter maps to the `--tmpfs` option in Docker. Defaults to 50% of the
+        memory allocated for this step.
+    tmpfs_path : str, optional, default None
+        Path to tmpfs mount for this step. Defaults to /metaflow_temp.
+    inferentia : int, default 0
+        Number of Inferentia chips required for this step.
+    trainium : int, default None
+        Alias for inferentia. Use only one of the two.
+    efa : int, default 0
+        Number of elastic fabric adapter network devices to attach to container
+    ephemeral_storage : int, default None
+        The total amount, in GiB, of ephemeral storage to set for the task, 21-200GiB.
+        This is only relevant for Fargate compute environments
+    log_driver: str, optional, default None
+        The log driver to use for the Amazon ECS container.
+    log_options: List[str], optional, default None
+        List of strings containing options for the chosen log driver. The configurable values
+        depend on the `log driver` chosen. Validation of these options is not supported yet.
+        Example: [`awslogs-group:aws/batch/job`]
     """
 
     name = "batch"
@@ -84,7 +107,19 @@ class BatchDecorator(StepDecorator):
         "shared_memory": None,
         "max_swap": None,
         "swappiness": None,
+        "inferentia": None,
+        "trainium": None,  # alias for inferentia
+        "efa": None,
         "host_volumes": None,
+        "efs_volumes": None,
+        "use_tmpfs": False,
+        "tmpfs_tempdir": True,
+        "tmpfs_size": None,
+        "tmpfs_path": "/metaflow_temp",
+        "ephemeral_storage": None,
+        "log_driver": None,
+        "log_options": None,
+        "executable": None,
     }
     resource_defaults = {
         "cpu": "1",
@@ -95,8 +130,12 @@ class BatchDecorator(StepDecorator):
     package_sha = None
     run_time_limit = None
 
-    def __init__(self, attributes=None, statically_defined=False):
-        super(BatchDecorator, self).__init__(attributes, statically_defined)
+    # Conda environment support
+    supports_conda_environment = True
+    target_platform = "linux-64"
+
+    def init(self):
+        super(BatchDecorator, self).init()
 
         # If no docker image is explicitly specified, impute a default image.
         if not self.attributes["image"]:
@@ -106,7 +145,7 @@ class BatchDecorator(StepDecorator):
             # If metaflow-config doesn't specify a docker image, assign a
             # default docker image.
             else:
-                # Metaflow-R has it's own default docker image (rocker family)
+                # Metaflow-R has its own default docker image (rocker family)
                 if R.use_r():
                     self.attributes["image"] = R.container_image()
                 # Default to vanilla Python image corresponding to major.minor
@@ -123,6 +162,21 @@ class BatchDecorator(StepDecorator):
                     BATCH_CONTAINER_REGISTRY.rstrip("/"),
                     self.attributes["image"],
                 )
+
+        # Alias trainium to inferentia and check that both are not in use.
+        if (
+            self.attributes["inferentia"] is not None
+            and self.attributes["trainium"] is not None
+        ):
+            raise BatchException(
+                "only specify a value for 'inferentia' or 'trainium', not both."
+            )
+
+        if self.attributes["trainium"] is not None:
+            self.attributes["inferentia"] = self.attributes["trainium"]
+
+        # clean up the alias attribute so it is not passed on.
+        self.attributes.pop("trainium", None)
 
     # Refer https://github.com/Netflix/metaflow/blob/master/docs/lifecycle.png
     # to understand where these functions are invoked in the lifecycle of a
@@ -148,6 +202,10 @@ class BatchDecorator(StepDecorator):
                 "The timeout for step *{step}* should be at "
                 "least 60 seconds for execution on AWS Batch.".format(step=step)
             )
+
+        # Validate tmpfs_path. Batch requires this to be an absolute path
+        if self.attributes["tmpfs_path"] and self.attributes["tmpfs_path"][0] != "/":
+            raise BatchException("'tmpfs_path' needs to be an absolute path")
 
     def runtime_init(self, flow, graph, package, run_id):
         # Set some more internal state.
@@ -194,25 +252,34 @@ class BatchDecorator(StepDecorator):
         self.metadata = metadata
         self.task_datastore = task_datastore
 
+        # current.tempdir reflects the value of METAFLOW_TEMPDIR (the current working
+        # directory by default), or the value of tmpfs_path if tmpfs_tempdir=False.
+        if not self.attributes["tmpfs_tempdir"]:
+            current._update_env({"tempdir": self.attributes["tmpfs_path"]})
+
         # task_pre_step may run locally if fallback is activated for @catch
         # decorator. In that scenario, we skip collecting AWS Batch execution
         # metadata. A rudimentary way to detect non-local execution is to
         # check for the existence of AWS_BATCH_JOB_ID environment variable.
 
+        meta = {}
         if "AWS_BATCH_JOB_ID" in os.environ:
-            meta = {}
             meta["aws-batch-job-id"] = os.environ["AWS_BATCH_JOB_ID"]
             meta["aws-batch-job-attempt"] = os.environ["AWS_BATCH_JOB_ATTEMPT"]
             meta["aws-batch-ce-name"] = os.environ["AWS_BATCH_CE_NAME"]
             meta["aws-batch-jq-name"] = os.environ["AWS_BATCH_JQ_NAME"]
             meta["aws-batch-execution-env"] = os.environ["AWS_EXECUTION_ENV"]
 
-            # Capture AWS Logs metadata. This is best effort only since
+            # Capture AWS Logs metadata. This is best-effort only since
             # only V4 of the metadata uri for the ECS container hosts this
-            # information and it is quite likely that not all consumers of
+            # information, and it is quite likely that not all consumers of
             # Metaflow would be running the container agent compatible with
             # version V4.
             # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task-metadata-endpoint.html
+
+            # TODO: Remove dependency on requests
+            import requests
+
             try:
                 logs_meta = (
                     requests.get(url=os.environ["ECS_CONTAINER_METADATA_URI_V4"])
@@ -225,17 +292,8 @@ class BatchDecorator(StepDecorator):
             except:
                 pass
 
-            entries = [
-                MetaDatum(
-                    field=k,
-                    value=v,
-                    type=k,
-                    tags=["attempt_id:{0}".format(retry_count)],
-                )
-                for k, v in meta.items()
-            ]
-            # Register book-keeping metadata for debugging.
-            metadata.register_metadata(run_id, step_name, task_id, entries)
+            instance_meta = get_ec2_instance_metadata()
+            meta.update(instance_meta)
 
             self._save_logs_sidecar = Sidecar("save_logs_periodically")
             self._save_logs_sidecar.start()
@@ -257,11 +315,25 @@ class BatchDecorator(StepDecorator):
 
         if num_parallel >= 1:
             _setup_multinode_environment()
+            # current.parallel.node_index will be correctly available over here.
+            meta.update({"parallel-node-index": current.parallel.node_index})
+
+        if len(meta) > 0:
+            entries = [
+                MetaDatum(
+                    field=k,
+                    value=v,
+                    type=k,
+                    tags=["attempt_id:{0}".format(retry_count)],
+                )
+                for k, v in meta.items()
+            ]
+            # Register book-keeping metadata for debugging.
+            metadata.register_metadata(run_id, step_name, task_id, entries)
 
     def task_finished(
         self, step_name, flow, graph, is_task_ok, retry_count, max_retries
     ):
-
         # task_finished may run locally if fallback is activated for @catch
         # decorator.
         if "AWS_BATCH_JOB_ID" in os.environ:
@@ -269,7 +341,7 @@ class BatchDecorator(StepDecorator):
             # execution metadata from the AWS Batch container to user's
             # local file system after the user code has finished execution.
             # This happens via datastore as a communication bridge.
-            if self.metadata.TYPE == "local":
+            if hasattr(self, "metadata") and self.metadata.TYPE == "local":
                 # Note that the datastore is *always* Amazon S3 (see
                 # runtime_task_created function).
                 sync_local_metadata_to_datastore(
@@ -287,9 +359,9 @@ class BatchDecorator(StepDecorator):
 
     def _wait_for_mapper_tasks(self, flow, step_name):
         """
-        When lauching multinode task with UBF, need to wait for the secondary
+        When launching multinode task with UBF, need to wait for the secondary
         tasks to finish cleanly and produce their output before exiting the
-        main task. Otherwise main task finishing will cause secondary nodes
+        main task. Otherwise, the main task finishing will cause secondary nodes
         to terminate immediately, and possibly prematurely.
         """
         from metaflow import Step  # avoid circular dependency
@@ -314,7 +386,7 @@ class BatchDecorator(StepDecorator):
                             len(flow._control_mapper_tasks),
                         )
                     )
-            except Exception as e:
+            except Exception:
                 pass
         raise Exception(
             "Batch secondary workers did not finish in %s seconds" % TIMEOUT

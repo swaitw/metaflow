@@ -1,11 +1,13 @@
 from collections import namedtuple
 import gzip
 
+import importlib
 import io
 import json
 import os
 
 from hashlib import sha1
+from typing import Any, Callable, Dict, Optional
 
 from metaflow._vendor import click
 
@@ -16,6 +18,9 @@ from .parameters import (
     Parameter,
     ParameterContext,
 )
+
+from .plugins import DATACLIENTS
+from .user_configs.config_parameters import ConfigValue
 from .util import get_username
 
 import functools
@@ -46,10 +51,7 @@ _DelayedExecContext = namedtuple(
 
 
 # From here on out, this is the IncludeFile implementation.
-from .datatools import Local, S3
-from metaflow.plugins.azure.includefile_support import Azure
-
-DATACLIENTS = {"local": Local, "s3": S3, "azure": Azure}
+_dict_dataclients = {d.TYPE: d for d in DATACLIENTS}
 
 
 class IncludedFile(object):
@@ -58,7 +60,7 @@ class IncludedFile(object):
     # the actual content)
 
     # @tracefunc
-    def __init__(self, descriptor):
+    def __init__(self, descriptor: Dict[str, Any]):
         self._descriptor = descriptor
         self._cached_size = None
 
@@ -100,7 +102,7 @@ class FilePathClass(click.ParamType):
         self._encoding = encoding
 
     def convert(self, value, param, ctx):
-        # Click can call convert multiple times so we need to make sure to only
+        # Click can call convert multiple times, so we need to make sure to only
         # convert once. This function will return a DelayedEvaluationParameter
         # (if it needs to still perform an upload) or an IncludedFile if not
         if isinstance(value, (DelayedEvaluationParameter, IncludedFile)):
@@ -121,7 +123,7 @@ class FilePathClass(click.ParamType):
         #        can change unlike all other artifacts. It is trivial to re-enable
         #      + B.2: an actual path to a local file like /foo/bar
         #    In the first case, we just store an *external* reference to it (so we
-        #    won't upload anything). In the second case, we will want to upload something
+        #    won't upload anything). In the second case we will want to upload something,
         #    but we only do that in the DelayedEvaluationParameter step.
 
         # ctx can be one of two things:
@@ -135,18 +137,21 @@ class FilePathClass(click.ParamType):
                 parameter_name=param.name,
                 logger=ctx.obj.echo,
                 ds_type=ctx.obj.datastore_impl.TYPE,
+                configs=None,
             )
 
-        if len(value) > 0 and value[0] == "{":
-            # This is a blob; no URL starts with "{". We are thus in scenario A
+        if len(value) > 0 and (value.startswith("{") or value.startswith('"{')):
+            # This is a blob; no URL starts with `{`. We are thus in scenario A
             try:
                 value = json.loads(value)
+                # to handle quoted json strings
+                if not isinstance(value, dict):
+                    value = json.loads(value)
             except json.JSONDecodeError as e:
                 raise MetaflowException(
                     "IncludeFile '%s' (value: %s) is malformed" % (param.name, value)
                 )
-            # All processing has already been done so we just convert to a
-            # IncludedFile
+            # All processing has already been done, so we just convert to an `IncludedFile`
             return IncludedFile(value)
 
         path = os.path.expanduser(value)
@@ -158,7 +163,7 @@ class FilePathClass(click.ParamType):
                 "IncludeFile using a direct reference to a file in cloud storage is no "
                 "longer supported. Contact the Metaflow team if you need this supported"
             )
-            # if DATACLIENTS.get(path[:prefix_pos]) is None:
+            # if _dict_dataclients.get(path[:prefix_pos]) is None:
             #     self.fail(
             #         "IncludeFile: no handler for external file of type '%s' "
             #         "(given path is '%s')" % (path[:prefix_pos], path)
@@ -178,7 +183,7 @@ class FilePathClass(click.ParamType):
                     pass
             except OSError:
                 self.fail("IncludeFile: could not open file '%s' for reading" % path)
-            handler = DATACLIENTS.get(ctx.ds_type)
+            handler = _dict_dataclients.get(ctx.ds_type)
             if handler is None:
                 self.fail(
                     "IncludeFile: no data-client for datastore of type '%s'"
@@ -186,7 +191,7 @@ class FilePathClass(click.ParamType):
                 )
 
             # Now that we have done preliminary checks, we will delay uploading it
-            # until later (so it happens after PyLint checks the flow but we prepare
+            # until later (so it happens after PyLint checks the flow, but we prepare
             # everything for it)
             lambda_ctx = _DelayedExecContext(
                 flow_name=ctx.flow_name,
@@ -204,7 +209,7 @@ class FilePathClass(click.ParamType):
                         ctx.path,
                         ctx.is_text,
                         ctx.encoding,
-                        DATACLIENTS[ctx.handler_type],
+                        _dict_dataclients[ctx.handler_type],
                         ctx.echo,
                     )
                 )
@@ -237,26 +242,66 @@ class IncludeFile(Parameter):
     ----------
     name : str
         User-visible parameter name.
-    default : str or a function
+    default : Union[str, Callable[ParameterContext, str]]
         Default path to a local file. A function
         implies that the parameter corresponds to a *deploy-time parameter*.
-    is_text : bool
-        Convert the file contents to a string using the provided `encoding` (default: True).
-        If False, the artifact is stored in `bytes`.
-    encoding : str
-        Use this encoding to decode the file contexts if `is_text=True` (default: `utf-8`).
-    required : bool
+    is_text : bool, optional, default None
+        Convert the file contents to a string using the provided `encoding`.
+        If False, the artifact is stored in `bytes`. A value of None is equivalent to
+        True.
+    encoding : str, optional, default None
+        Use this encoding to decode the file contexts if `is_text=True`. A value of None
+        is equivalent to "utf-8".
+    required : bool, optional, default None
         Require that the user specified a value for the parameter.
-        `required=True` implies that the `default` is not used.
-    help : str
+        `required=True` implies that the `default` is not used. A value of None is
+        equivalent to False
+    help : str, optional
         Help text to show in `run --help`.
-    show_default : bool
-        If True, show the default value in the help text (default: True).
+    show_default : bool, default True
+        If True, show the default value in the help text. A value of None is equivalent
+        to True.
     """
 
     def __init__(
-        self, name, required=False, is_text=True, encoding=None, help=None, **kwargs
+        self,
+        name: str,
+        required: Optional[bool] = None,
+        is_text: Optional[bool] = None,
+        encoding: Optional[str] = None,
+        help: Optional[str] = None,
+        **kwargs: Dict[str, str]
     ):
+        self._includefile_overrides = {}
+        if is_text is not None:
+            self._includefile_overrides["is_text"] = is_text
+        if encoding is not None:
+            self._includefile_overrides["encoding"] = encoding
+        # NOTA: Right now, there is an issue where these can't be overridden by config
+        # in all circumstances. Ignoring for now.
+        super(IncludeFile, self).__init__(
+            name,
+            required=required,
+            help=help,
+            type=FilePathClass(
+                self._includefile_overrides.get("is_text", True),
+                self._includefile_overrides.get("encoding", "utf-8"),
+            ),
+            **kwargs,
+        )
+
+    def init(self, ignore_errors=False):
+        super(IncludeFile, self).init(ignore_errors)
+
+        # This will use the values set explicitly in the args if present, else will
+        # use and remove from kwargs else will use True/utf-8
+        is_text = self._includefile_overrides.get(
+            "is_text", self.kwargs.pop("is_text", True)
+        )
+        encoding = self._includefile_overrides.get(
+            "encoding", self.kwargs.pop("encoding", "utf-8")
+        )
+
         # If a default is specified, it needs to be uploaded when the flow is deployed
         # (for example when doing a `step-functions create`) so we make the default
         # be a DeployTimeField. This means that it will be evaluated in two cases:
@@ -266,7 +311,7 @@ class IncludeFile(Parameter):
         # In the first case, we will need to fully upload the file whereas in the
         # second case, we can just return the string as the FilePath.convert method
         # will take care of evaluating things.
-        v = kwargs.get("default")
+        v = self.kwargs.get("default")
         if v is not None:
             # If the default is a callable, we have two DeployTimeField:
             #  - the callable nature of the default will require us to "call" the default
@@ -279,22 +324,14 @@ class IncludeFile(Parameter):
             # (call the default)
             if callable(v) and not isinstance(v, DeployTimeField):
                 # If default is a callable, make it a DeployTimeField (the inner one)
-                v = DeployTimeField(name, str, "default", v, return_str=True)
-            kwargs["default"] = DeployTimeField(
-                name,
+                v = DeployTimeField(self.name, str, "default", v, return_str=True)
+            self.kwargs["default"] = DeployTimeField(
+                self.name,
                 str,
                 "default",
                 IncludeFile._eval_default(is_text, encoding, v),
                 print_representation=v,
             )
-
-        super(IncludeFile, self).__init__(
-            name,
-            required=required,
-            help=help,
-            type=FilePathClass(is_text, encoding),
-            **kwargs,
-        )
 
     def load_parameter(self, v):
         if v is None:
@@ -315,8 +352,8 @@ class IncludeFile(Parameter):
                 val = fp.convert(d, None, ctx)
                 if isinstance(val, DelayedEvaluationParameter):
                     val = val()
-                # At this point, this is an IncludedFile but we need to make it
-                # into a string so it can be properly saved.
+                # At this point this is an IncludedFile, but we need to make it
+                # into a string so that it can be properly saved.
                 return json.dumps(val.descriptor)
             else:
                 return d
@@ -387,7 +424,7 @@ class UploaderV1:
             obj = client.get(url, return_missing=True)
             if obj.exists:
                 if descriptor["type"] == cls.file_type:
-                    # We saved this file directly so we know how to read it out
+                    # We saved this file directly, so we know how to read it out
                     with gzip.GzipFile(filename=obj.path, mode="rb") as f:
                         if descriptor["is_text"]:
                             return io.TextIOWrapper(
@@ -410,14 +447,13 @@ class UploaderV1:
         if prefix_pos < 0:
             raise MetaflowException("Malformed URL: '%s'" % url)
         prefix = url[:prefix_pos]
-        handler = DATACLIENTS.get(prefix)
+        handler = _dict_dataclients.get(prefix)
         if handler is None:
             raise MetaflowException("Could not find data client for '%s'" % prefix)
         return handler
 
 
 class UploaderV2:
-
     file_type = "uploader-v2"
 
     @classmethod
@@ -447,7 +483,7 @@ class UploaderV2:
         if descriptor["sub-type"] == "uploaded":
             return descriptor["size"]
         else:
-            # This was a file that was external so we get information on it
+            # This was a file that was external, so we get information on it
             url = descriptor["url"]
             handler = cls._get_handler(url)
             with handler() as client:
@@ -468,7 +504,7 @@ class UploaderV2:
             obj = client.get(url, return_missing=True)
             if obj.exists:
                 if descriptor["sub-type"] == "uploaded":
-                    # We saved this file directly so we know how to read it out
+                    # We saved this file directly, so we know how to read it out
                     with gzip.GzipFile(filename=obj.path, mode="rb") as f:
                         if descriptor["is_text"]:
                             return io.TextIOWrapper(

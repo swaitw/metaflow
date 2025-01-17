@@ -44,7 +44,7 @@ def _full_classname(obj):
 
 
 class TaskToDict:
-    def __init__(self, only_repr=False):
+    def __init__(self, only_repr=False, runtime=False):
         # this dictionary holds all the supported functions
         import reprlib
         import pprint
@@ -59,6 +59,7 @@ class TaskToDict:
         r.maxlist = 100
         r.maxlevel = 3
         self._repr = r
+        self._runtime = runtime
         self._only_repr = only_repr
         self._supported_types = {
             "tuple": self._parse_tuple,
@@ -90,11 +91,16 @@ class TaskToDict:
             stderr=task.stderr,
             stdout=task.stdout,
             created_at=task.created_at.strftime(TIME_FORMAT),
-            finished_at=task.finished_at.strftime(TIME_FORMAT),
+            finished_at=None,
             pathspec=task.pathspec,
             graph=graph,
             data={},
         )
+        if not self._runtime:
+            if task.finished_at is not None:
+                task_dict.update(
+                    dict(finished_at=task.finished_at.strftime(TIME_FORMAT))
+                )
         task_dict["data"], type_infered_objects = self._create_task_data_dict(task)
         task_dict.update(type_infered_objects)
         return task_dict
@@ -102,7 +108,7 @@ class TaskToDict:
     def _create_task_data_dict(self, task):
 
         task_data_dict = {}
-        type_infered_objects = {"images": {}, "tables": {}}
+        type_inferred_objects = {"images": {}, "tables": {}}
         for data in task:
             try:
                 data_object = data.data
@@ -124,11 +130,11 @@ class TaskToDict:
             type_resolved_obj = self._extract_type_infered_object(data_object)
             if type_resolved_obj is not None:
                 if type_resolved_obj.is_image:
-                    type_infered_objects["images"][data.id] = type_resolved_obj.data
+                    type_inferred_objects["images"][data.id] = type_resolved_obj.data
                 elif type_resolved_obj.is_table:
-                    type_infered_objects["tables"][data.id] = type_resolved_obj.data
+                    type_inferred_objects["tables"][data.id] = type_resolved_obj.data
 
-        return task_data_dict, type_infered_objects
+        return task_data_dict, type_inferred_objects
 
     def object_type(self, object):
         return self._get_object_type(object)
@@ -140,7 +146,7 @@ class TaskToDict:
             import imghdr
 
             resp = imghdr.what(None, h=data_object)
-            # Only accept types suppored on the web
+            # Only accept types supported on the web
             # https://developer.mozilla.org/en-US/docs/Web/Media/Formats/Image_types
             if resp is not None and resp in ["gif", "png", "jpeg", "webp"]:
                 return self._parse_image(data_object, resp)
@@ -154,7 +160,7 @@ class TaskToDict:
             import imghdr
 
             resp = imghdr.what(None, h=data_object)
-            # Only accept types suppored on the web
+            # Only accept types supported on the web
             # https://developer.mozilla.org/en-US/docs/Web/Media/Formats/Image_types
             if resp is not None and resp in ["gif", "png", "jpeg", "webp"]:
                 return TypeResolvedObject(
@@ -213,7 +219,7 @@ class TaskToDict:
         supported_type = False
         large_object = False
         obj_type_name = self._get_object_type(data_object)
-        if obj_type_name == None:
+        if obj_type_name is None:
             return rep.repr(data_object), obj_type_name, supported_type, large_object
         elif self._only_repr:
             return (
@@ -295,25 +301,96 @@ class TaskToDict:
     def _parse_range(self, data_object):
         return self._get_repr().repr(data_object)
 
+    @staticmethod
+    def _parse_pandas_column(column_object):
+        # There are two types of parsing we do here.
+        # 1. We explicitly parse the types we know how to parse
+        # 2. We try to partially match a type name to the column's type.
+        #   - We do this because `datetime64` can match `datetime64[ns]` and `datetime64[ns, UTC]`
+        #   - We do this because period can match `period[D]` and `period[2D]` etc.
+        #   - There are just too many types to explicitly parse so we go by this heuristic
+        # We have a default parser called `truncate_long_objects` which type casts any column to string
+        # and truncates it to 30 characters.
+        # If there is any form of TypeError or ValueError we set the column value to "Unsupported Type"
+        # We also set columns which are have null values to "null" strings
+        time_format = "%Y-%m-%dT%H:%M:%S%Z"
+        truncate_long_objects = lambda x: (
+            x.astype("string").str.slice(0, 30) + "..."
+            if len(x) > 0 and x.astype("string").str.len().max() > 30
+            else x.astype("string")
+        )
+        type_parser = {
+            "int64": lambda x: x,
+            "float64": lambda x: x,
+            "bool": lambda x: x,
+            "object": lambda x: truncate_long_objects(x.fillna("null")),
+            "category": truncate_long_objects,
+        }
+
+        partial_type_name_match_parsers = {
+            "complex": {
+                "complex": lambda x: x.astype("string"),
+            },
+            "datetime": {
+                "datetime64": lambda x: x.dt.strftime(time_format),
+                "timedelta": lambda x: x.dt.total_seconds(),
+            },
+            "interval": {
+                "interval": lambda x: x.astype("string"),
+            },
+            "period": {
+                "period": lambda x: x.astype("string"),
+            },
+        }
+
+        def _match_partial_type():
+            col_type = column_object.dtype
+            for _, type_parsers in partial_type_name_match_parsers.items():
+                for type_name, parser in type_parsers.items():
+                    if type_name in str(col_type):
+                        return parser(column_object)
+            return None
+
+        try:
+            col_type = str(column_object.dtype)
+            if col_type in type_parser:
+                return type_parser[col_type](column_object.fillna("null"))
+            else:
+                parsed_col = _match_partial_type()
+                if parsed_col is not None:
+                    return parsed_col.fillna("null")
+            return truncate_long_objects(column_object.fillna("null"))
+        except ValueError as e:
+            return "Unsupported type: {0}".format(col_type)
+        except TypeError as e:
+            return "Unsupported type: {0}".format(col_type)
+
     def _parse_pandas_dataframe(self, data_object, truncate=True):
         headers = list(data_object.columns)
         data = data_object
         if truncate:
             data = data_object.head()
         index_column = data.index
-        time_format = "%Y-%m-%dT%H:%M:%SZ"
-        if index_column.dtype == "datetime64[ns]":
-            if index_column.__class__.__name__ == "DatetimeIndex":
-                index_column = index_column.strftime(time_format)
-            else:
-                index_column = index_column.dt.strftime(time_format)
+
+        # We explicitly cast the `index_column` object to an `Index` or `MultiIndex` having JSON-castable values.
+        if index_column.__class__.__name__ == "MultiIndex":
+            from pandas import MultiIndex
+
+            cols = [
+                self._parse_pandas_column(
+                    index_column.get_level_values(name).to_series()
+                )
+                for name in index_column.names
+            ]
+            index_column = MultiIndex.from_arrays(cols, names=index_column.names)
+        else:
+            from pandas import Index
+
+            index_column = Index(self._parse_pandas_column(index_column.to_series()))
 
         for col in data.columns:
-            # we convert datetime columns to strings
-            if data[col].dtype == "datetime64[ns]":
-                data[col] = data[col].dt.strftime(time_format)
+            data[col] = self._parse_pandas_column(data[col])
 
-        data = data.astype(object).where(data.notnull(), None)
         data_vals = data.values.tolist()
         for row, idx in zip(data_vals, index_column.values.tolist()):
             row.insert(0, idx)

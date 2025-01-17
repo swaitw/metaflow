@@ -3,23 +3,92 @@ import re
 from metaflow.exception import MetaflowException
 
 
+def parse_s3_full_path(s3_uri):
+    from urllib.parse import urlparse
+
+    #  <scheme>://<netloc>/<path>;<params>?<query>#<fragment>
+    scheme, netloc, path, _, _, _ = urlparse(s3_uri)
+    assert scheme == "s3"
+    assert netloc is not None
+
+    bucket = netloc
+    path = path.lstrip("/").rstrip("/")
+    if path == "":
+        path = None
+
+    return bucket, path
+
+
+def get_ec2_instance_metadata():
+    """
+    Fetches the EC2 instance metadata through AWS instance metadata service
+
+    Returns either an empty dictionary, or one with the keys
+        - ec2-instance-id
+        - ec2-instance-type
+        - ec2-region
+        - ec2-availability-zone
+    """
+
+    # TODO: Remove dependency on requests
+    import requests
+
+    meta = {}
+    # Capture AWS instance identity metadata. This is best-effort only since
+    # access to this end-point might be blocked on AWS and not available
+    # for non-AWS deployments.
+    # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-identity-documents.html
+    # Set a very aggressive timeout, as the communication is happening in the same subnet,
+    # there should not be any significant delay in the response.
+    # Having a long default timeout here introduces unnecessary delay in launching tasks when the
+    # instance is unreachable.
+    timeout = (1, 10)
+    token = None
+    try:
+        # Try to get an IMDSv2 token.
+        token = requests.put(
+            url="http://169.254.169.254/latest/api/token",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": 100},
+            timeout=timeout,
+        ).text
+    except:
+        pass
+    try:
+        headers = {}
+        # Add IMDSv2 token if available, else fall back to IMDSv1.
+        if token:
+            headers["X-aws-ec2-metadata-token"] = token
+        instance_meta = requests.get(
+            url="http://169.254.169.254/latest/dynamic/instance-identity/document",
+            headers=headers,
+            timeout=timeout,
+        ).json()
+        meta["ec2-instance-id"] = instance_meta.get("instanceId")
+        meta["ec2-instance-type"] = instance_meta.get("instanceType")
+        meta["ec2-region"] = instance_meta.get("region")
+        meta["ec2-availability-zone"] = instance_meta.get("availabilityZone")
+    except:
+        pass
+    return meta
+
+
 def get_docker_registry(image_uri):
     """
     Explanation:
-        (.+?(?:[:.].+?)\/)? - [GROUP 0] REGISTRY
-            .+?                 - A registry must start with at least one character
-            (?:[:.].+?)\/       - A registry must have ":" or "." and end with "/"
-            ?                   - Make a registry optional
-        (.*?)               - [GROUP 1] REPOSITORY
-            .*?                 - Get repository name until separator
-        (?:[@:])?           - SEPARATOR
-            ?:                  - Don't capture separator
-            [@:]                - The separator must be either "@" or ":"
-            ?                   - The separator is optional
-        ((?<=[@:]).*)?      - [GROUP 2] TAG / DIGEST
-            (?<=[@:])           - A tag / digest must be preceeded by "@" or ":"
-            .*                  - Capture rest of tag / digest
-            ?                   - A tag / digest is optional
+        (.+?(?:[:.].+?)\\/)? - [GROUP 0] REGISTRY
+            .+?                  - A registry must start with at least one character
+            (?:[:.].+?)\\/       - A registry must have ":" or "." and end with "/"
+            ?                    - Make a registry optional
+        (.*?)                - [GROUP 1] REPOSITORY
+            .*?                  - Get repository name until separator
+        (?:[@:])?            - SEPARATOR
+            ?:                   - Don't capture separator
+            [@:]                 - The separator must be either "@" or ":"
+            ?                    - The separator is optional
+        ((?<=[@:]).*)?       - [GROUP 2] TAG / DIGEST
+            (?<=[@:])            - A tag / digest must be preceded by "@" or ":"
+            .*                   - Capture rest of tag / digest
+            ?                    - A tag / digest is optional
     Examples:
         image
             - None
@@ -63,7 +132,7 @@ def compute_resource_attributes(decos, compute_deco, resource_defaults):
     Returns a dictionary of resource attr -> value (str).
     """
     assert compute_deco is not None
-
+    supported_keys = set([*resource_defaults.keys(), *compute_deco.attributes.keys()])
     # Use the value from resource_defaults by default (don't use None)
     result = {k: v for k, v in resource_defaults.items() if v is not None}
 
@@ -75,6 +144,11 @@ def compute_resource_attributes(decos, compute_deco, resource_defaults):
                 # We use the non None value if there is only one or the larger value
                 # if they are both non None. Note this considers "" to be equivalent to
                 # the value zero.
+                #
+                # Skip attributes that are not supported by the decorator.
+                if k not in supported_keys:
+                    continue
+
                 if my_val is None and v is None:
                     continue
                 if my_val is not None and v is not None:
@@ -85,9 +159,11 @@ def compute_resource_attributes(decos, compute_deco, resource_defaults):
                         # about precision more that .001 for resources anyway.
                         result[k] = str(max(float(my_val or 0), float(v or 0)))
                     except ValueError:
-                        # Here, we don't have ints so we compare the value and raise
+                        # Here we don't have ints, so we compare the value and raise
                         # an exception if not equal
                         if my_val != v:
+                            # TODO: Throw a better exception since the user has no
+                            #       knowledge of 'compute' decorator
                             raise MetaflowException(
                                 "'resources' and compute decorator have conflicting "
                                 "values for '%s'. Please use consistent values or "
@@ -106,3 +182,15 @@ def compute_resource_attributes(decos, compute_deco, resource_defaults):
             result[k] = str(compute_deco.attributes[k] or "0")
 
     return result
+
+
+def sanitize_batch_tag(key, value):
+    """
+    Sanitize a key and value for use as a Batch tag.
+    """
+    # https://docs.aws.amazon.com/batch/latest/userguide/using-tags.html#tag-restrictions
+    RE_NOT_PERMITTED = r"[^A-Za-z0-9\s\+\-\=\.\_\:\/\@]"
+    _key = re.sub(RE_NOT_PERMITTED, "", key)[:128]
+    _value = re.sub(RE_NOT_PERMITTED, "", value)[:256]
+
+    return _key, _value

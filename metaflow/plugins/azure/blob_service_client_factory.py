@@ -1,8 +1,10 @@
 from metaflow.exception import MetaflowException
 from metaflow.metaflow_config import AZURE_STORAGE_BLOB_SERVICE_ENDPOINT
 from metaflow.plugins.azure.azure_utils import (
-    create_cacheable_default_azure_credentials,
     check_azure_deps,
+)
+from metaflow.plugins.azure.azure_credential import (
+    create_cacheable_azure_credential,
 )
 
 import os
@@ -89,7 +91,7 @@ class _ClientCache(object):
 # Block size on underlying down TLS transport - Azure SDK defaults to 4096.
 # This larger block size dramatically improves aggregate download throughput.
 # 256KB (within order of 2x) seemed optimal for specific benchmark setup.
-# In future, exposing this as a tunable to users is a possibility if necessary.
+# In the future, exposing this as a tunable to users is a possibility if necessary.
 AZURE_CLIENT_CONNECTION_DATA_BLOCK_SIZE = 262144
 
 # When to use more than a single thread / connection for a single GET or PUT.
@@ -125,7 +127,7 @@ def get_azure_blob_service_client(
     blob_service_endpoint = AZURE_STORAGE_BLOB_SERVICE_ENDPOINT
 
     if not credential:
-        credential = create_cacheable_default_azure_credentials()
+        credential = create_cacheable_azure_credential()
         credential_is_cacheable = True
 
     if not credential_is_cacheable:

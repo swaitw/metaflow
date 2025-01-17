@@ -25,8 +25,8 @@ RUNTIME_LOG_SOURCE = "runtime"
 TASK_LOG_SOURCE = "task"
 
 # Loglines from all sources need to be merged together to
-# produce a complete view of logs. Hence keep this list short
-# since every items takes a DataStore access.
+# produce a complete view of logs. Hence, keep this list short
+# since each item takes a DataStore access.
 LOG_SOURCES = [RUNTIME_LOG_SOURCE, TASK_LOG_SOURCE]
 
 # BASH_MFLOG defines a bash function that outputs valid mflog
@@ -43,6 +43,7 @@ BASH_MFLOG = (
 
 BASH_SAVE_LOGS_ARGS = ["python", "-m", "metaflow.mflog.save_logs"]
 BASH_SAVE_LOGS = " ".join(BASH_SAVE_LOGS_ARGS)
+
 
 # this function returns a bash expression that redirects stdout
 # and stderr of the given bash expression to mflog.tee
@@ -92,7 +93,6 @@ def export_mflog_env_vars(
     stdout_path=None,
     stderr_path=None,
 ):
-
     pathspec = "/".join((flow_name, str(run_id), step_name, str(task_id)))
     env_vars = {
         "PYTHONUNBUFFERED": "x",
@@ -117,7 +117,9 @@ def tail_logs(prefix, stdout_tail, stderr_tail, echo, has_log_updates):
                     line = set_should_persist(line)
                 else:
                     line = refine(line, prefix=prefix)
-                echo(line.strip().decode("utf-8", errors="replace"), stream)
+                echo(
+                    line.strip().decode("utf-8", errors="replace"), stream, no_bold=True
+                )
         except Exception as ex:
             echo(
                 "%s[ temporary error in fetching logs: %s ]" % (to_unicode(prefix), ex),
@@ -147,13 +149,17 @@ def tail_logs(prefix, stdout_tail, stderr_tail, echo, has_log_updates):
 
 def get_log_tailer(log_url, datastore_type):
     if datastore_type == "s3":
-        from metaflow.datatools.s3tail import S3Tail
+        from metaflow.plugins.datatools.s3.s3tail import S3Tail
 
         return S3Tail(log_url)
     elif datastore_type == "azure":
         from metaflow.plugins.azure.azure_tail import AzureTail
 
         return AzureTail(log_url)
+    elif datastore_type == "gs":
+        from metaflow.plugins.gcp.gs_tail import GSTail
+
+        return GSTail(log_url)
     else:
         raise MetaflowInternalError(
             "Log tailing implementation missing for datastore type %s"
